@@ -137,7 +137,24 @@ class WorkflowDB:
     # ── Schema init ──────────────────────────────────────────────────
 
     def _init_schema(self) -> None:
+        """Create tables. Migrates from v0.1.x schema if needed."""
         with self._lock:
+            # Detect if we need migration: the 'workflows' table is new in v1.
+            # If it doesn't exist, we may have old v0.1.x tables that need
+            # to be dropped before the new schema can be applied.
+            try:
+                self._conn.execute("SELECT 1 FROM workflows LIMIT 0")
+            except sqlite3.OperationalError:
+                # 'workflows' table doesn't exist — we're either fresh or
+                # running against a v0.1.x database. Drop old tables so
+                # CREATE TABLE IF NOT EXISTS doesn't leave stale schemas.
+                logger.info("Migrating from v0.1.x schema — dropping old tables")
+                self._conn.execute("DROP TABLE IF EXISTS workflow_state")
+                self._conn.execute("DROP TABLE IF EXISTS pending_actions")
+                # Also drop any old indexes that may linger
+                self._conn.execute("DROP INDEX IF EXISTS idx_pending_status")
+                self._conn.execute("DROP INDEX IF EXISTS idx_pending_cron_job")
+
             self._conn.executescript(SCHEMA_SQL)
 
     # ── Write helper ─────────────────────────────────────────────────
