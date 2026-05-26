@@ -564,7 +564,7 @@
 
 			React.createElement(
 				Tabs,
-				{ value: tab, onValueChange: setTab },
+				{ value: tab, onChange: setTab },
 				React.createElement(
 					TabsList,
 					null,
