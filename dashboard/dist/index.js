@@ -32,7 +32,7 @@
 	var TabsList = SDK.components.TabsList
 	var TabsTrigger = SDK.components.TabsTrigger
 	var Separator = SDK.components.Separator
-	var Spinner = SDK.components.Spinner
+	// Spinner is not in the documented SDK — use inline loading element instead.
 
 	var api = SDK.api
 	var fetchJSON = SDK.fetchJSON
@@ -519,7 +519,21 @@
 			return React.createElement(
 				"div",
 				{ className: "flex items-center justify-center py-12" },
-				React.createElement(Spinner, null),
+				React.createElement(
+					"div",
+					{
+						className:
+							"inline-block h-6 w-6 animate-spin rounded-full border-2 border-border border-t-primary",
+						role: "status",
+					},
+					React.createElement(
+						"span",
+						{
+							className: "sr-only",
+						},
+						"Loading…",
+					),
+				),
 			)
 		}
 
