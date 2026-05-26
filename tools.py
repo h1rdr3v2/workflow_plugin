@@ -1,26 +1,262 @@
 """
-Tool handlers for the Workflow Engine plugin.
+Workflow Engine — Tool Handlers.
 
-Each handler receives args (dict) from the LLM and returns a JSON string.
-Follows Hermes conventions:
+Each handler receives args (dict) and optional keyword arguments from
+the Hermes tool dispatch layer, and returns a JSON string.
+
+Conventions:
 - Signature: def handler(args: dict, **kwargs) -> str
 - Always returns a JSON string, even on error
 - Never raises exceptions — catch and return error JSON
-- Accept **kwargs for forward compatibility
+- The **kwargs parameter captures any future Hermes additions and
+  may include 'workflow_id' to identify the current execution context
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict
 
 from .db import get_db
+from .scheduler import schedule_workflow, unschedule_workflow
+
+logger = logging.getLogger(__name__)
 
 
-# ── workflow_save_state ───────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
+    """
+    Extract the workflow_id from the execution context.
+    
+    In a workflow run, kwargs includes the workflow_id of the currently
+    executing workflow. For tools called outside a workflow run (e.g.,
+    create, list), this returns None.
+    """
+    return (kwargs.get("workflow_id") or "").strip() or None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. workflow_create
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+    name = (args.get("name") or "").strip()
+    cron_expression = (args.get("cron_expression") or "").strip()
+    prompt = (args.get("prompt") or "").strip()
+    description = (args.get("description") or "").strip()
+
+    # Validation
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+    if not name:
+        return json.dumps({"error": "name is required"})
+    if not cron_expression:
+        return json.dumps({"error": "cron_expression is required"})
+    if not prompt:
+        return json.dumps({"error": "prompt is required"})
+
+    # Basic cron validation
+    parts = cron_expression.split()
+    if len(parts) != 5:
+        return json.dumps({
+            "error": f"cron_expression must have exactly 5 fields, got {len(parts)}. Example: '0 9 * * 1-5'"
+        })
+
+    try:
+        db = get_db()
+        wf = db.create_workflow(workflow_id, name, cron_expression, prompt, description)
+
+        # Schedule it immediately
+        schedule_workflow(wf)
+
+        return json.dumps({
+            "success": True,
+            "workflow_id": workflow_id,
+            "name": name,
+            "cron_expression": cron_expression,
+            "message": f"Workflow '{name}' created and scheduled with cron '{cron_expression}'. It will run automatically on schedule.",
+        })
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.exception("Failed to create workflow '%s'", workflow_id)
+        return json.dumps({"error": f"Failed to create workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. workflow_update
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+
+    try:
+        db = get_db()
+
+        # Build kwargs for update, only passing provided fields
+        update_kwargs: Dict[str, Any] = {}
+        for field in ("name", "description", "cron_expression", "prompt"):
+            if field in args and args[field] is not None:
+                update_kwargs[field] = (args[field] or "").strip()
+
+        if "enabled" in args and args["enabled"] is not None:
+            update_kwargs["enabled"] = bool(args["enabled"])
+
+        result = db.update_workflow(workflow_id, **update_kwargs)
+
+        if result is None:
+            return json.dumps({
+                "success": False,
+                "message": f"Workflow '{workflow_id}' not found.",
+            })
+
+        # Re-schedule to pick up cron/enabled changes
+        schedule_workflow(result)
+
+        return json.dumps({
+            "success": True,
+            "workflow_id": workflow_id,
+            "updated_fields": list(update_kwargs.keys()),
+            "message": f"Workflow '{workflow_id}' updated.",
+        })
+    except Exception as e:
+        logger.exception("Failed to update workflow '%s'", workflow_id)
+        return json.dumps({"error": f"Failed to update workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. workflow_delete
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_delete(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+
+    try:
+        db = get_db()
+        existed = db.delete_workflow(workflow_id)
+
+        if existed:
+            unschedule_workflow(workflow_id)
+            return json.dumps({
+                "success": True,
+                "message": f"Workflow '{workflow_id}' deleted permanently, including all state and pending actions.",
+            })
+        else:
+            return json.dumps({
+                "success": False,
+                "message": f"Workflow '{workflow_id}' not found.",
+            })
+    except Exception as e:
+        logger.exception("Failed to delete workflow '%s'", workflow_id)
+        return json.dumps({"error": f"Failed to delete workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. workflow_list
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_list(args: Dict[str, Any], **kwargs: Any) -> str:
+    enabled_only = bool(args.get("enabled_only", False))
+
+    try:
+        db = get_db()
+        workflows = db.list_workflows(enabled_only=enabled_only)
+
+        if not workflows:
+            return json.dumps({
+                "workflows": [],
+                "count": 0,
+                "message": "No workflows found. Create one with workflow_create().",
+            })
+
+        # Strip prompt for brevity in list view
+        summary = []
+        for wf in workflows:
+            summary.append({
+                "workflow_id": wf["id"],
+                "name": wf["name"],
+                "description": wf.get("description", ""),
+                "cron_expression": wf["cron_expression"],
+                "enabled": bool(wf["enabled"]),
+                "created_at": wf["created_at"],
+            })
+
+        return json.dumps({
+            "workflows": summary,
+            "count": len(summary),
+            "message": f"Found {len(summary)} workflow(s).",
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to list workflows: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. workflow_get
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_get(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+
+    try:
+        db = get_db()
+        wf = db.get_workflow(workflow_id)
+
+        if wf is None:
+            return json.dumps({
+                "found": False,
+                "message": f"Workflow '{workflow_id}' not found.",
+            })
+
+        # Gather state keys and pending actions
+        state_keys = db.list_state_keys(workflow_id)
+        pending = db.list_pending_actions(workflow_id=workflow_id, status="pending")
+
+        return json.dumps({
+            "found": True,
+            "workflow": {
+                "id": wf["id"],
+                "name": wf["name"],
+                "description": wf.get("description", ""),
+                "cron_expression": wf["cron_expression"],
+                "prompt": wf["prompt"],
+                "enabled": bool(wf["enabled"]),
+                "created_at": wf["created_at"],
+                "updated_at": wf["updated_at"],
+            },
+            "state_keys": state_keys,
+            "state_count": len(state_keys),
+            "pending_actions": [
+                {
+                    "action_id": pa["id"],
+                    "question": pa["question"],
+                    "status": pa["status"],
+                    "created_at": pa["created_at"],
+                }
+                for pa in pending
+            ],
+            "pending_count": len(pending),
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to get workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. workflow_save_state
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_save_state(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Persist a workflow state value."""
     key = (args.get("key") or "").strip()
     value_raw = args.get("value")
 
@@ -30,8 +266,14 @@ def _handle_save_state(args: Dict[str, Any], **kwargs: Any) -> str:
     if value_raw is None:
         return json.dumps({"error": "value is required"})
 
-    # value arrives as a string from the LLM. Attempt to parse as JSON
-    # so we store structured data; fall back to raw string.
+    # Get current workflow from context
+    current_wf = _get_current_workflow_id(kwargs)
+    if not current_wf:
+        return json.dumps({
+            "error": "No workflow context available. workflow_save_state can only be called during a workflow run."
+        })
+
+    # Parse value: try JSON, fall back to raw string
     try:
         if isinstance(value_raw, str):
             parsed = json.loads(value_raw)
@@ -42,37 +284,47 @@ def _handle_save_state(args: Dict[str, Any], **kwargs: Any) -> str:
 
     try:
         db = get_db()
-        db.save_state(key, parsed)
+        db.save_state(current_wf, key, parsed)
         return json.dumps({
             "success": True,
+            "workflow_id": current_wf,
             "key": key,
-            "message": f"State saved for key '{key}'.",
+            "message": f"State '{key}' saved for workflow '{current_wf}'.",
         })
     except Exception as e:
         return json.dumps({"error": f"Failed to save state: {e}"})
 
 
-# ── workflow_load_state ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. workflow_load_state
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_load_state(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Retrieve a workflow state value."""
     key = (args.get("key") or "").strip()
 
     if not key:
         return json.dumps({"error": "key is required"})
 
+    current_wf = _get_current_workflow_id(kwargs)
+    if not current_wf:
+        return json.dumps({
+            "error": "No workflow context available. workflow_load_state can only be called during a workflow run."
+        })
+
     try:
         db = get_db()
-        value = db.load_state(key)
+        value = db.load_state(current_wf, key)
         if value is None:
             return json.dumps({
                 "found": False,
+                "workflow_id": current_wf,
                 "key": key,
                 "value": None,
-                "message": f"No state found for key '{key}'. Initialize defaults as needed.",
+                "message": f"No state found for key '{key}' in workflow '{current_wf}'. Initialize defaults as needed.",
             })
         return json.dumps({
             "found": True,
+            "workflow_id": current_wf,
             "key": key,
             "value": value,
         })
@@ -80,126 +332,167 @@ def _handle_load_state(args: Dict[str, Any], **kwargs: Any) -> str:
         return json.dumps({"error": f"Failed to load state: {e}"})
 
 
-# ── workflow_wait_for_user ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. workflow_delete_state
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_delete_state(args: Dict[str, Any], **kwargs: Any) -> str:
+    key = (args.get("key") or "").strip()
+
+    if not key:
+        return json.dumps({"error": "key is required"})
+
+    current_wf = _get_current_workflow_id(kwargs)
+    if not current_wf:
+        return json.dumps({
+            "error": "No workflow context available. workflow_delete_state can only be called during a workflow run."
+        })
+
+    try:
+        db = get_db()
+        existed = db.delete_state(current_wf, key)
+        return json.dumps({
+            "success": True,
+            "deleted": existed,
+            "workflow_id": current_wf,
+            "key": key,
+            "message": f"State key '{key}' {'deleted' if existed else 'was not found'}.",
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to delete state: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. workflow_wait_for_user
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Pause workflow and wait for human input."""
-    workflow_id = (args.get("workflow_id") or "").strip()
     question = (args.get("question") or "").strip()
-    cron_job_id = (args.get("cron_job_id") or "").strip() or None
     context = (args.get("context") or "").strip() or None
 
-    if not workflow_id:
-        return json.dumps({"error": "workflow_id is required"})
     if not question:
         return json.dumps({"error": "question is required"})
+
+    current_wf = _get_current_workflow_id(kwargs)
+    if not current_wf:
+        return json.dumps({
+            "error": "No workflow context available. workflow_wait_for_user can only be called during a workflow run."
+        })
 
     try:
         db = get_db()
         action = db.create_pending_action(
-            workflow_id=workflow_id,
+            workflow_id=current_wf,
             question=question,
-            cron_job_id=cron_job_id,
             context=context,
         )
+
         return json.dumps({
             "success": True,
-            "workflow_id": workflow_id,
+            "action_id": action["id"],
+            "workflow_id": current_wf,
             "status": "pending",
             "message": (
-                f"Workflow '{workflow_id}' is now waiting for human input. "
-                f"The user can respond with: workflow_submit_response('{workflow_id}', '<their answer>') "
-                f"or by using the /workflows command. "
-                f"This cron job should now END — the workflow will resume on "
-                f"a future run once the human responds."
+                f"Workflow '{current_wf}' is now paused, awaiting human input. "
+                f"The human can respond via the dashboard or /workflows command. "
+                f"IMPORTANT: End this run now. The workflow will resume on the "
+                f"next scheduled tick after the human responds."
             ),
         })
     except Exception as e:
         return json.dumps({"error": f"Failed to pause workflow: {e}"})
 
 
-# ── workflow_submit_response ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. workflow_submit_response
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_submit_response(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Submit a human response to a pending workflow."""
-    workflow_id = (args.get("workflow_id") or "").strip()
+    action_id = (args.get("action_id") or "").strip()
     response = (args.get("response") or "").strip()
 
-    if not workflow_id:
-        return json.dumps({"error": "workflow_id is required"})
+    if not action_id:
+        return json.dumps({"error": "action_id is required"})
     if not response:
         return json.dumps({"error": "response is required"})
 
     try:
         db = get_db()
-        resolved = db.resolve_pending_action(workflow_id, response)
+        resolved = db.resolve_pending_action(action_id, response)
+
         if resolved is None:
             return json.dumps({
                 "success": False,
-                "workflow_id": workflow_id,
-                "message": f"No pending workflow found with ID '{workflow_id}'. It may have already been resolved.",
+                "message": f"No pending action found with ID '{action_id}'. It may have already been resolved or dismissed.",
             })
+
         return json.dumps({
             "success": True,
-            "workflow_id": workflow_id,
+            "action_id": action_id,
+            "workflow_id": resolved["workflow_id"],
             "status": "resolved",
-            "response": response,
             "message": (
-                f"Response submitted for workflow '{workflow_id}'. "
-                f"The agent will see this response on its next cron execution."
+                f"Response submitted for '{action_id}'. "
+                f"The workflow will see this response on its next scheduled run."
             ),
         })
     except Exception as e:
         return json.dumps({"error": f"Failed to submit response: {e}"})
 
 
-# ── workflow_list_pending ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. workflow_list_pending
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_list_pending(args: Dict[str, Any], **kwargs: Any) -> str:
-    """List workflows waiting for human input."""
-    cron_job_id = (args.get("cron_job_id") or "").strip() or None
+    workflow_id = (args.get("workflow_id") or "").strip() or None
 
     try:
         db = get_db()
-        actions = db.list_pending_actions(status="pending", cron_job_id=cron_job_id)
+        actions = db.list_pending_actions(workflow_id=workflow_id, status="pending")
 
         if not actions:
             return json.dumps({
                 "pending_count": 0,
-                "pending_workflows": [],
+                "pending_actions": [],
                 "message": "No pending workflows awaiting human input.",
             })
 
-        # Format for LLM readability
         formatted = []
         for a in actions:
             formatted.append({
+                "action_id": a["id"],
                 "workflow_id": a["workflow_id"],
                 "question": a["question"],
                 "context": a.get("context"),
-                "cron_job_id": a.get("cron_job_id"),
                 "created_at": a["created_at"],
             })
 
         return json.dumps({
             "pending_count": len(formatted),
-            "pending_workflows": formatted,
+            "pending_actions": formatted,
             "message": (
-                f"Found {len(formatted)} pending workflow(s). "
-                f"To respond to one, use workflow_submit_response(workflow_id, response). "
-                f"The agent should check these and incorporate any human responses "
-                f"into the current run."
+                f"Found {len(formatted)} pending action(s). "
+                f"To respond, use workflow_submit_response(action_id, response)."
             ),
         })
     except Exception as e:
-        return json.dumps({"error": f"Failed to list pending workflows: {e}"})
+        return json.dumps({"error": f"Failed to list pending actions: {e}"})
 
 
-# ── Handler map ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Handler map — used by __init__.py to wire schemas to implementations
+# ═══════════════════════════════════════════════════════════════════════════
 
 HANDLER_MAP = {
+    "workflow_create": _handle_create,
+    "workflow_update": _handle_update,
+    "workflow_delete": _handle_delete,
+    "workflow_list": _handle_list,
+    "workflow_get": _handle_get,
     "workflow_save_state": _handle_save_state,
     "workflow_load_state": _handle_load_state,
+    "workflow_delete_state": _handle_delete_state,
     "workflow_wait_for_user": _handle_wait_for_user,
     "workflow_submit_response": _handle_submit_response,
     "workflow_list_pending": _handle_list_pending,

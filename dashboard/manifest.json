@@ -1,14 +1,13 @@
 {
 	"name": "workflow",
 	"label": "Workflows",
-	"description": "Manage pending workflow approvals, view state history, and respond to paused agent workflows.",
+	"description": "Create and manage scheduled workflows with persistent state and human-in-the-loop interactions.",
 	"icon": "Activity",
-	"version": "0.1.9",
+	"version": "1.0.0",
 	"tab": {
 		"path": "/workflows",
 		"position": "after:cron"
 	},
-	"slots": ["cron:bottom"],
 	"entry": "dist/index.js",
 	"api": "plugin_api.py"
 }

@@ -1,63 +1,221 @@
 """
-Tool schemas for the Workflow Engine plugin.
+Workflow Engine — Tool Schemas.
 
-These schemas are read by the LLM to decide when to call each tool.
-Each follows the Hermes convention: name, description, parameters.
+Each schema follows the Hermes convention: name, description, parameters.
+These are read by the LLM to decide when and how to call each tool.
 """
 
-# ── workflow_save_state ───────────────────────────────────────────────────
+from __future__ import annotations
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. workflow_create
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_CREATE = {
+    "name": "workflow_create",
+    "description": (
+        "Create a new scheduled workflow. A workflow is a cron-like job that "
+        "runs on a schedule, has its own persistent state, and can pause for "
+        "human input when needed.\n\n"
+        "Use this when a user asks you to set up an automated recurring task — "
+        "like a daily report, a rotation manager, a monitoring check, or any "
+        "job that should run on a fixed schedule.\n\n"
+        "IMPORTANT: The workflow_id must be a unique slug (lowercase, "
+        "underscores, no spaces). The cron_expression is a standard 5-field "
+        "cron string (e.g., '0 9 * * 1-5' for weekdays at 9am). The prompt "
+        "should be a clear system instruction telling the agent what to do "
+        "on each run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "Unique slug for this workflow. Use lowercase, underscores, no spaces. E.g., 'daily_standup_reminder' or 'pr_review_rotation'.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Human-readable name for the workflow. E.g., 'Daily Standup Reminder'.",
+            },
+            "cron_expression": {
+                "type": "string",
+                "description": "Standard 5-field cron expression. E.g., '0 9 * * 1-5' (weekdays at 9am), '*/30 * * * *' (every 30 minutes), '0 0 1 * *' (midnight on the 1st of each month).",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "System prompt / instructions for the agent on each run. Describe what the agent should do step-by-step. Include reminders to use workflow_load_state at the start and workflow_save_state before finishing.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional: a short description of what this workflow does. Shown in the dashboard.",
+            },
+        },
+        "required": ["workflow_id", "name", "cron_expression", "prompt"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. workflow_update
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_UPDATE = {
+    "name": "workflow_update",
+    "description": (
+        "Update an existing workflow — change its schedule, prompt, name, "
+        "or enable/disable it. Only the workflow_id is required; all other "
+        "fields are optional and only updated if provided.\n\n"
+        "Use this when a user wants to modify a workflow's behavior, pause "
+        "it temporarily, or change its run frequency."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "The ID of the workflow to update.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Optional: new human-readable name.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional: new description.",
+            },
+            "cron_expression": {
+                "type": "string",
+                "description": "Optional: new cron expression.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Optional: new system prompt.",
+            },
+            "enabled": {
+                "type": "boolean",
+                "description": "Optional: set to true to enable, false to pause/disable.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. workflow_delete
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_DELETE = {
+    "name": "workflow_delete",
+    "description": (
+        "Permanently delete a workflow and all its saved state and pending "
+        "actions. This cannot be undone.\n\n"
+        "Use this when a user wants to remove an automated workflow entirely."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "The ID of the workflow to delete.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. workflow_list
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_LIST = {
+    "name": "workflow_list",
+    "description": (
+        "List all workflows. Returns each workflow's id, name, schedule, "
+        "enabled status, and next scheduled run time.\n\n"
+        "Use this when a user asks 'what workflows do I have?' or 'show me "
+        "my automations'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "enabled_only": {
+                "type": "boolean",
+                "description": "If true, only return enabled workflows. Default: false (show all).",
+            },
+        },
+        "required": [],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. workflow_get
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_GET = {
+    "name": "workflow_get",
+    "description": (
+        "Get full details of a single workflow including its definition, "
+        "saved state keys, and any pending human-input requests.\n\n"
+        "Use this when a user asks about a specific workflow, or when you "
+        "need to inspect a workflow's configuration before modifying it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "The ID of the workflow to inspect.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. workflow_save_state
+# ═══════════════════════════════════════════════════════════════════════════
 
 WORKFLOW_SAVE_STATE = {
     "name": "workflow_save_state",
     "description": (
-        "Save a persistent state value that will survive across cron job "
-        "executions and agent restarts. Use this to remember decisions, "
-        "assignments, counters, rotation history, or any data that needs "
-        "to carry over to the next run. The value can be any JSON-serializable "
-        "object (string, number, list, dict, boolean). Overwrites any "
-        "existing value for the same key.\n\n"
-        "CRITICAL: Always call this before completing a cron job if you "
-        "have made decisions that the next run should know about. Without "
-        "this, every cron execution starts from a blank slate."
+        "Save a persistent value for the CURRENT workflow. This value will "
+        "survive across runs and be available the next time this workflow "
+        "executes.\n\n"
+        "CRITICAL: Always save state before completing a workflow run if "
+        "you made decisions the next run needs to know about (assignments, "
+        "counters, rotation state, last-run summary, etc.).\n\n"
+        "The workflow_id is automatically inferred from the current "
+        "execution context — you only need to provide key and value."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "key": {
                 "type": "string",
-                "description": (
-                    "A unique key identifying this state. Use namespaced keys "
-                    "like 'assignment_rotation', 'last_run_summary', or "
-                    "'review_queue.v2' to keep state organized across workflows."
-                ),
+                "description": "A descriptive key for this state value. Use names like 'assignment_rotation', 'last_run_summary', 'review_queue', etc.",
             },
             "value": {
                 "type": "string",
-                "description": (
-                    "The value to store, serialized as a JSON string. Pass "
-                    "complex structures as a JSON-encoded string "
-                    "(e.g., '{\"last\": \"alice\", \"history\": [\"bob\", \"carol\"]}'). "
-                    "The value will be deserialized back to its original form "
-                    "when loaded."
-                ),
+                "description": "The value to store, serialized as a JSON string. For complex data, use json.dumps(). E.g., '{\"last\": \"alice\", \"history\": [\"bob\", \"carol\"]}'.",
             },
         },
         "required": ["key", "value"],
     },
 }
 
-# ── workflow_load_state ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. workflow_load_state
+# ═══════════════════════════════════════════════════════════════════════════
 
 WORKFLOW_LOAD_STATE = {
     "name": "workflow_load_state",
     "description": (
-        "Retrieve a previously saved workflow state value. Use this at the "
-        "START of every cron job to understand what happened in prior runs — "
-        "who was assigned last time, what decisions were made, what the "
-        "current rotation state is, etc.\n\n"
-        "Returns the stored value (deserialized), or an error if the key "
-        "doesn't exist. Always check for missing keys and initialize defaults "
-        "when a key is not found."
+        "Retrieve a previously saved state value for the CURRENT workflow. "
+        "Use this at the START of every workflow run to understand what "
+        "happened in prior executions.\n\n"
+        "Returns the stored value (deserialized from JSON), or an indicator "
+        "that the key wasn't found. Always handle missing keys by "
+        "initializing sensible defaults.\n\n"
+        "The workflow_id is automatically inferred — you only need the key."
     ),
     "parameters": {
         "type": "object",
@@ -71,130 +229,131 @@ WORKFLOW_LOAD_STATE = {
     },
 }
 
-# ── workflow_wait_for_user ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. workflow_delete_state
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_DELETE_STATE = {
+    "name": "workflow_delete_state",
+    "description": (
+        "Delete a state key for the CURRENT workflow. Use this to clean up "
+        "old or obsolete state data.\n\n"
+        "The workflow_id is automatically inferred — you only need the key."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "key": {
+                "type": "string",
+                "description": "The state key to delete.",
+            },
+        },
+        "required": ["key"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. workflow_wait_for_user
+# ═══════════════════════════════════════════════════════════════════════════
 
 WORKFLOW_WAIT_FOR_USER = {
     "name": "workflow_wait_for_user",
     "description": (
-        "Pause the current workflow and wait for a human to provide input "
-        "before continuing. Use this when:\n"
-        "- You need approval for an action or decision\n"
-        "- You are uncertain and need human guidance\n"
-        "- A task requires information only the user can provide\n"
-        "- You want the user to confirm before proceeding with something risky\n\n"
-        "The workflow will be paused and listed as pending. The human can "
-        "respond with workflow_submit_response or via the /workflows command. "
-        "On the NEXT cron run, use workflow_load_state to check for the "
-        "response. ALWAYS include enough context so the human understands "
-        "what they're being asked about.\n\n"
-        "IMPORTANT: After calling this, the current cron run should END. "
-        "The workflow will resume on a future run once the human responds."
+        "Pause the CURRENT workflow and wait for a human to provide input. "
+        "Use this when you need approval, clarification, or a decision only "
+        "a human can make.\n\n"
+        "CRITICAL: After calling this, you MUST end the current run. The "
+        "workflow will resume on the next scheduled tick once the human "
+        "responds. Do NOT continue processing after calling this.\n\n"
+        "The human can respond via the Workflows dashboard or the "
+        "/workflows slash command. Their response will be injected into "
+        "the next run's context automatically."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "workflow_id": {
-                "type": "string",
-                "description": (
-                    "A unique ID for this workflow pause point. Use a "
-                    "descriptive name like 'assignment_approval_20260526' or "
-                    "'review_assignment_bob'. This ID is used to match the "
-                    "human's response back to this specific question."
-                ),
-            },
             "question": {
                 "type": "string",
-                "description": (
-                    "The specific question or decision the human needs to "
-                    "respond to. Be clear and actionable. Example: 'Should I "
-                    "assign this review to Bob? He has the least recent "
-                    "assignment but was on PTO last week.'"
-                ),
-            },
-            "cron_job_id": {
-                "type": "string",
-                "description": (
-                    "Optional: The cron job ID this workflow belongs to. "
-                    "Helps organize pending workflows by job. If the agent "
-                    "knows the cron job ID, pass it here."
-                ),
+                "description": "The specific question or decision the human needs to answer. Be clear and actionable. Example: 'Should I escalate this alert? The error rate is 4.7% which is above the 3% threshold.'",
             },
             "context": {
                 "type": "string",
-                "description": (
-                    "Additional context to present to the human reviewer. "
-                    "Include relevant history, current state, options "
-                    "considered, and the reasoning behind the question. "
-                    "This is shown alongside the question. Can be a JSON "
-                    "string for structured data."
-                ),
+                "description": "Optional: additional context to help the human understand the situation. Can be a JSON string with structured data or plain text. Include relevant state, options, and reasoning.",
             },
         },
-        "required": ["workflow_id", "question"],
+        "required": ["question"],
     },
 }
 
-# ── workflow_submit_response ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. workflow_submit_response
+# ═══════════════════════════════════════════════════════════════════════════
 
 WORKFLOW_SUBMIT_RESPONSE = {
     "name": "workflow_submit_response",
     "description": (
-        "Submit a human's response to a previously paused workflow, resuming "
-        "it. This is typically called by the human via a slash command or "
-        "chat, NOT by the agent during a cron run.\n\n"
-        "When a response is submitted, the workflow is marked as 'resolved' "
-        "and the agent will see the response on its next cron execution "
-        "when it calls workflow_load_state or the pre_llm_call hook injects it."
+        "Submit a human's response to a previously paused workflow question. "
+        "This resolves the pending action so the agent sees the response on "
+        "its next scheduled run.\n\n"
+        "Typically called by the human via the /workflows command or "
+        "dashboard, NOT by the agent during a workflow run."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "workflow_id": {
+            "action_id": {
                 "type": "string",
-                "description": "The workflow ID to respond to (same as used in workflow_wait_for_user).",
+                "description": "The ID of the pending action to respond to.",
             },
             "response": {
                 "type": "string",
                 "description": "The human's answer, decision, or instruction.",
             },
         },
-        "required": ["workflow_id", "response"],
+        "required": ["action_id", "response"],
     },
 }
 
-# ── workflow_list_pending ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. workflow_list_pending
+# ═══════════════════════════════════════════════════════════════════════════
 
 WORKFLOW_LIST_PENDING = {
     "name": "workflow_list_pending",
     "description": (
         "List all workflows that are currently waiting for human input. "
-        "Use this at the START of a cron job to check if any previous "
-        "workflows have been paused and are awaiting responses. Also useful "
-        "for humans to review pending approvals via /workflows.\n\n"
-        "Returns the list of pending workflows with their questions, context, "
-        "and creation timestamps. Filter by cron_job_id if you only care "
-        "about a specific job's pending workflows."
+        "Returns each pending question with its workflow_id, action_id, "
+        "and when it was created.\n\n"
+        "Use this at the start of a workflow run to check if there are "
+        "outstanding human questions, or use it as a human to see what "
+        "needs your attention. Filter by workflow_id to see only a "
+        "specific workflow's pending items."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "cron_job_id": {
+            "workflow_id": {
                 "type": "string",
-                "description": (
-                    "Optional: Filter to only show pending workflows for "
-                    "a specific cron job. Omit to see all pending workflows."
-                ),
+                "description": "Optional: filter to show pending actions for a specific workflow only.",
             },
         },
         "required": [],
     },
 }
 
-# ── All schemas ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# All schemas
+# ═══════════════════════════════════════════════════════════════════════════
 
 ALL_SCHEMAS = [
+    WORKFLOW_CREATE,
+    WORKFLOW_UPDATE,
+    WORKFLOW_DELETE,
+    WORKFLOW_LIST,
+    WORKFLOW_GET,
     WORKFLOW_SAVE_STATE,
     WORKFLOW_LOAD_STATE,
+    WORKFLOW_DELETE_STATE,
     WORKFLOW_WAIT_FOR_USER,
     WORKFLOW_SUBMIT_RESPONSE,
     WORKFLOW_LIST_PENDING,

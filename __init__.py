@@ -1,14 +1,15 @@
 """
 Workflow Engine Plugin — Registration.
 
-Provides persistent workflow state and human-in-the-loop interaction
-for Hermes cron agents. Tools, hooks, slash commands, and a bundled
-skill are all wired here.
+The entry point for Hermes. Wires up all 11 tools, hooks, slash commands,
+the scheduler, and the bundled workflow-agent skill.
 
 Key components:
-- 5 tools: save_state, load_state, wait_for_user, submit_response, list_pending
-- pre_llm_call hook: injects previous state + pending responses into cron sessions
-- /workflows slash command: human interface to review and respond to pending workflows
+- 11 tools: create, update, delete, list, get, save/load/delete state,
+  wait_for_user, submit_response, list_pending
+- pre_llm_call hook: injects workflow state + pending responses into agent context
+- plugin_shutdown hook: gracefully stops the scheduler
+- /workflows slash command: human interface to review and respond
 - workflow-agent skill: teaches the agent the workflow pattern
 """
 
@@ -19,13 +20,15 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import schemas, tools
+from . import executor, schemas, tools
 from .db import get_db
+from .scheduler import shutdown as scheduler_shutdown
+from .scheduler import start as scheduler_start
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# pre_llm_call hook — inject workflow context into cron sessions
+# pre_llm_call hook — inject workflow context into agent sessions
 # ---------------------------------------------------------------------------
 
 
@@ -37,88 +40,88 @@ def _inject_workflow_context(
     **kwargs: Any,
 ) -> Optional[Dict[str, str]]:
     """
-    Called before each LLM turn. When running inside a cron session,
-    this hook injects:
-    1. Previously saved workflow state relevant to the cron job
-    2. Any pending human responses that the agent should act on
+    Called before each LLM turn. When running inside a workflow execution
+    session, injects:
+    1. Previously saved workflow state
+    2. Any pending or recently resolved human responses
 
     Only injects on the first turn to avoid repeating context.
-    Cron sessions are identified by session_id starting with 'cron_'.
     """
-    # Only inject on the first turn
     if not is_first_turn:
         return None
 
-    # Only inject for cron sessions
-    if not session_id.startswith("cron_"):
+    # Extract workflow_id from the session context if available
+    workflow_id = kwargs.get("workflow_id") or ""
+    if not workflow_id:
         return None
 
     try:
         db = get_db()
     except Exception:
-        return None  # DB unavailable — silently skip
+        return None
 
     context_parts: List[str] = []
     context_parts.append("[WORKFLOW ENGINE — Persistent Context]")
 
-    # ── 1. Identify the cron job ID from the session ──
-    # Cron sessions use the format: cron_{job_id}_{timestamp}
-    cron_job_id: Optional[str] = None
-    parts = session_id.split("_", 1)
-    if len(parts) > 1:
-        # Extract job_id — it's everything between 'cron_' and the last timestamp segment
-        remaining = parts[1]
-        # The timestamp is the last 2 segments: YYYYMMDD_HHMMSS
-        segments = remaining.rsplit("_", 2)
-        if len(segments) >= 2:
-            cron_job_id = segments[0] if len(segments) > 2 else remaining
+    # ── 1. Workflow info ──────────────────────────────────────────────
+    wf = db.get_workflow(workflow_id)
+    if wf is None:
+        return None
 
-    # ── 2. Inject pending workflow responses ──
+    context_parts.append(f"\n## Workflow: {wf['name']} (`{workflow_id}`)")
+    if wf.get("description"):
+        context_parts.append(f"_{wf['description']}_")
+
+    # ── 2. Saved state ────────────────────────────────────────────────
     try:
-        pending = db.list_pending_actions(status="pending")
-        resolved_for_job = db.list_pending_actions(status="resolved", cron_job_id=cron_job_id)
+        state_keys = db.list_state_keys(workflow_id)
     except Exception:
-        pending = []
-        resolved_for_job = []
+        state_keys = []
 
-    if resolved_for_job:
+    if state_keys:
+        context_parts.append("\n## Previously Saved State")
+        context_parts.append("The following state keys are available. Use workflow_load_state() to retrieve values:")
+        for key in state_keys[:30]:
+            context_parts.append(f"- `{key}`")
+        if len(state_keys) > 30:
+            context_parts.append(f"- ... and {len(state_keys) - 30} more keys")
+    else:
+        context_parts.append("\n## No saved state yet")
+        context_parts.append("This appears to be the first run. Use workflow_save_state() to persist data for future runs.")
+
+    # ── 3. Resolved responses ─────────────────────────────────────────
+    try:
+        resolved = db.get_resolved_since(workflow_id, 0)
+    except Exception:
+        resolved = []
+
+    if resolved:
         context_parts.append("\n## Recent Human Responses")
-        context_parts.append("The following workflows have been resolved by a human since your last run. Incorporate these responses into this execution:")
-        for action in resolved_for_job[:10]:  # limit to avoid bloat
+        context_parts.append("These questions were answered by a human since your last run. Incorporate them:")
+        for action in resolved[:10]:
             response_preview = (action.get("response") or "")[:500]
             context_parts.append(
-                f"- **{action['workflow_id']}**: {action.get('question', '')[:200]}\n"
-                f"  Response: {response_preview}"
+                f"- **Q**: {action.get('question', '')[:200]}\n"
+                f"  **A**: {response_preview}"
             )
+
+    # ── 4. Still-pending actions ──────────────────────────────────────
+    try:
+        pending = db.list_pending_actions(workflow_id=workflow_id, status="pending")
+    except Exception:
+        pending = []
 
     if pending:
-        context_parts.append("\n## Pending Workflows (Awaiting Human Input)")
-        context_parts.append("The following workflows are paused and waiting for a human response. If this run can contribute to any of them, check them:")
+        context_parts.append("\n## Still Pending (Awaiting Human Input)")
+        context_parts.append("These questions are waiting for a human response. Do NOT re-ask them:")
         for action in pending[:10]:
-            context_parts.append(
-                f"- **{action['workflow_id']}**: {action.get('question', '')[:200]}"
-            )
-
-    # ── 3. Inject previously saved state for this cron job ──
-    if cron_job_id:
-        try:
-            keys = db.list_state_keys(prefix=f"cron:{cron_job_id}:")
-            if not keys:
-                keys = db.list_state_keys()  # fallback: all keys
-        except Exception:
-            keys = []
-
-        if keys:
-            context_parts.append("\n## Previously Saved Workflow State")
-            context_parts.append("The following state was saved from prior runs. Use workflow_load_state() to retrieve full values as needed:")
-            for key in keys[:20]:
-                context_parts.append(f"- `{key}`")
+            context_parts.append(f"- {action.get('question', '')[:200]}")
 
     if len(context_parts) <= 1:
-        return None  # nothing to inject
+        return None
 
     context_text = "\n".join(context_parts)
-    logger.debug("Injecting workflow context for session %s (%d parts)", session_id, len(context_parts))
+    logger.debug("Injecting workflow context for session %s", session_id)
     return {"context": context_text}
 
 
@@ -127,39 +130,53 @@ def _inject_workflow_context(
 
 def _handle_workflows_slash(raw_args: str) -> str:
     """
-    Handler for /workflows — lets humans review and respond to pending workflows.
+    Handler for /workflows — human interface to review and respond.
 
     Usage:
-      /workflows                    — list all pending workflows
-      /workflows respond <id> <msg> — respond to a pending workflow
-      /workflows dismiss <id>       — dismiss a pending workflow
+      /workflows                        — list all workflows and pending actions
+      /workflows respond <id> <answer>  — respond to a pending action
+      /workflows dismiss <id>           — dismiss a pending action
     """
     args = raw_args.strip()
 
     if not args:
-        # List all pending
+        # Show summary: workflows + pending actions
         try:
             db = get_db()
+            workflows = db.list_workflows()
             pending = db.list_pending_actions(status="pending")
-            resolved = db.list_pending_actions(status="resolved")
         except Exception as e:
             return f"⚠️ Workflow engine unavailable: {e}"
 
-        lines = ["📋 **Pending Workflows**\n"]
-        if not pending:
-            lines.append("No pending workflows awaiting input.")
+        lines = ["📋 **Workflow Engine**\n"]
+
+        # Workflows
+        if not workflows:
+            lines.append("No workflows defined. Create one with `workflow_create` or via the dashboard.")
         else:
+            lines.append("### Scheduled Workflows")
+            for wf in workflows:
+                status_icon = "🟢" if wf["enabled"] else "🔴"
+                lines.append(
+                    f"{status_icon} **{wf['name']}** (`{wf['id']}`)\n"
+                    f"   Schedule: `{wf['cron_expression']}`\n"
+                    f"   Enabled: {'yes' if wf['enabled'] else 'no'}"
+                )
+
+        # Pending actions
+        if pending:
+            lines.append(f"\n### ⏳ Pending ({len(pending)} awaiting input)")
             for i, action in enumerate(pending, 1):
                 lines.append(
-                    f"**{i}. `{action['workflow_id']}`**\n"
+                    f"**{i}. `{action['id']}`** — {action['workflow_id']}\n"
                     f"> {action.get('question', '')}\n"
                     f"  Created: {_fmt_time(action.get('created_at'))}\n"
-                    f"  To respond: `/workflows respond {action['workflow_id']} <your answer>`"
+                    f"  Respond: `/workflows respond {action['id']} <your answer>`"
                 )
-        if resolved:
-            lines.append(f"\n_{len(resolved)} resolved workflow(s) — use `/workflows respond <id> ...` to add more._")
+        else:
+            lines.append("\n✅ No pending actions awaiting input.")
 
-        lines.append("\n---\nCommands: `list` | `respond <id> <msg>` | `dismiss <id>`")
+        lines.append("\n---\nCommands: `respond <id> <answer>` | `dismiss <id>`")
         return "\n".join(lines)
 
     # Parse subcommand
@@ -169,34 +186,40 @@ def _handle_workflows_slash(raw_args: str) -> str:
     if subcommand == "respond" and len(parts) > 1:
         rest = parts[1].split(maxsplit=1)
         if len(rest) < 2:
-            return "Usage: `/workflows respond <workflow_id> <your response>`"
-        workflow_id = rest[0].strip()
+            return "Usage: `/workflows respond <action_id> <your response>`"
+        action_id = rest[0].strip()
         response = rest[1].strip()
 
         try:
             db = get_db()
-            result = db.resolve_pending_action(workflow_id, response)
+            result = db.resolve_pending_action(action_id, response)
         except Exception as e:
             return f"⚠️ Error: {e}"
 
         if result is None:
-            return f"⚠️ No pending workflow found with ID `{workflow_id}`."
-        return f"✅ Response submitted for workflow `{workflow_id}`. The agent will see it on the next cron run."
+            return f"⚠️ No pending action found with ID `{action_id}`."
+        return (
+            f"✅ Response submitted for `{action_id}`. "
+            f"The workflow will see it on the next scheduled run."
+        )
 
     elif subcommand == "dismiss" and len(parts) > 1:
-        workflow_id = parts[1].strip()
+        action_id = parts[1].strip()
         try:
             db = get_db()
-            deleted = db.delete_pending_action(workflow_id)
+            dismissed = db.dismiss_pending_action(action_id)
         except Exception as e:
             return f"⚠️ Error: {e}"
 
-        if deleted:
-            return f"🗑️ Dismissed workflow `{workflow_id}`."
-        return f"⚠️ No pending workflow found with ID `{workflow_id}`."
+        if dismissed:
+            return f"🗑️ Dismissed pending action `{action_id}`."
+        return f"⚠️ No pending action found with ID `{action_id}`."
 
     else:
-        return f"Unknown subcommand: `{subcommand}`. Use `list`, `respond <id> <msg>`, or `dismiss <id>`."
+        return (
+            f"Unknown subcommand: `{subcommand}`. "
+            f"Use `respond <id> <answer>` or `dismiss <id>`."
+        )
 
 
 def _fmt_time(ts: Optional[float]) -> str:
@@ -207,56 +230,159 @@ def _fmt_time(ts: Optional[float]) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
 
 
+# ── plugin_shutdown hook ──────────────────────────────────────────────────
+
+
+def _on_shutdown(**kwargs: Any) -> None:
+    """Gracefully stop the scheduler when the plugin is unloaded."""
+    scheduler_shutdown(wait=False)
+
+
+# ── Agent invocation callback ─────────────────────────────────────────────
+
+
+def _agent_invoke(
+    workflow_id: str,
+    run_id: str,
+    system_prompt: str,
+    user_message: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """
+    Invoke the Hermes agent for a workflow execution.
+
+    This is called by the executor when a workflow tick fires.
+    The ctx reference is captured at registration time.
+    """
+    ctx = _agent_invoke._ctx  # type: ignore[attr-defined]
+
+    # Build a session that the agent can interact with
+    # The agent receives the system prompt + user message, and can
+    # call tools (save_state, wait_for_user, etc.)
+    try:
+        # Use Hermes's agent invocation API via ctx
+        # ctx.run_agent sends the prompt to the LLM with the registered tools
+        session_id = f"workflow_{workflow_id}_{run_id}"
+
+        # Register the workflow_id in the session context so tools can pick it up
+        # We rely on Hermes passing kwargs through to tool handlers
+        result = ctx.create_session(
+            session_id=session_id,
+            system_prompt=system_prompt,
+            toolset="workflow_engine",
+            metadata={
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+            },
+        )
+
+        if result is None:
+            return {"summary": "Agent session created but no result returned."}
+
+        # Send the user message to kick off the agent
+        response = ctx.send_message(
+            session_id=session_id,
+            message=user_message,
+        )
+
+        return {
+            "summary": response.get("content", "") if response else "",
+        }
+
+    except Exception as e:
+        logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
+        raise
+
+
+def _agent_invoke_factory(ctx: Any):
+    """Create a closure that captures ctx for agent invocation."""
+    def invoke(**kw: Any) -> Dict[str, Any]:
+        return _invoke_with_context(ctx, **kw)
+    return invoke
+
+
+def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
+    """Internal: invoke the agent using the captured Hermes context."""
+    workflow_id = kw.get("workflow_id", "")
+    run_id = kw.get("run_id", "")
+    system_prompt = kw.get("system_prompt", "")
+    user_message = kw.get("user_message", "")
+
+    session_id = f"workflow_{workflow_id}_{run_id}"
+
+    try:
+        # Create a temporary agent session with the workflow's tools
+        ctx.create_session(
+            session_id=session_id,
+            system_prompt=system_prompt,
+            toolset="workflow_engine",
+            metadata={
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+            },
+        )
+
+        # Send the trigger message
+        response = ctx.send_message(
+            session_id=session_id,
+            message=user_message,
+        )
+
+        return {
+            "summary": response.get("content", "") if response else "",
+        }
+
+    except Exception as e:
+        logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
+        raise
+
+
 # ── register() — plugin entry point ───────────────────────────────────────
 
 
 def register(ctx: Any) -> None:
     """
-    Wire schemas to handlers, register hooks, slash commands, and skills.
+    Wire all tools, hooks, commands, skills, and start the scheduler.
 
     Called once at Hermes startup.
     """
     toolset = "workflow_engine"
 
-    # ── Register all 5 tools ──────────────────────────────────────────
-    ctx.register_tool(
-        name="workflow_save_state",
-        toolset=toolset,
-        schema=schemas.WORKFLOW_SAVE_STATE,
-        handler=tools._handle_save_state,
-        description="Save persistent state across cron executions",
-    )
-    ctx.register_tool(
-        name="workflow_load_state",
-        toolset=toolset,
-        schema=schemas.WORKFLOW_LOAD_STATE,
-        handler=tools._handle_load_state,
-        description="Load previously saved workflow state",
-    )
-    ctx.register_tool(
-        name="workflow_wait_for_user",
-        toolset=toolset,
-        schema=schemas.WORKFLOW_WAIT_FOR_USER,
-        handler=tools._handle_wait_for_user,
-        description="Pause workflow and wait for human input",
-    )
-    ctx.register_tool(
-        name="workflow_submit_response",
-        toolset=toolset,
-        schema=schemas.WORKFLOW_SUBMIT_RESPONSE,
-        handler=tools._handle_submit_response,
-        description="Submit a human response to resume a paused workflow",
-    )
-    ctx.register_tool(
-        name="workflow_list_pending",
-        toolset=toolset,
-        schema=schemas.WORKFLOW_LIST_PENDING,
-        handler=tools._handle_list_pending,
-        description="List workflows awaiting human input",
-    )
+    # ── Set up agent invocation ───────────────────────────────────────
+    executor.set_agent_invoke(_agent_invoke_factory(ctx))
 
-    # ── Register pre_llm_call hook ────────────────────────────────────
+    # ── Register all 11 tools ─────────────────────────────────────────
+    schema_map = {
+        "workflow_create": schemas.WORKFLOW_CREATE,
+        "workflow_update": schemas.WORKFLOW_UPDATE,
+        "workflow_delete": schemas.WORKFLOW_DELETE,
+        "workflow_list": schemas.WORKFLOW_LIST,
+        "workflow_get": schemas.WORKFLOW_GET,
+        "workflow_save_state": schemas.WORKFLOW_SAVE_STATE,
+        "workflow_load_state": schemas.WORKFLOW_LOAD_STATE,
+        "workflow_delete_state": schemas.WORKFLOW_DELETE_STATE,
+        "workflow_wait_for_user": schemas.WORKFLOW_WAIT_FOR_USER,
+        "workflow_submit_response": schemas.WORKFLOW_SUBMIT_RESPONSE,
+        "workflow_list_pending": schemas.WORKFLOW_LIST_PENDING,
+    }
+
+    for name, schema in schema_map.items():
+        handler = tools.HANDLER_MAP.get(name)
+        if handler is None:
+            logger.error("No handler registered for tool '%s'", name)
+            continue
+
+        ctx.register_tool(
+            name=name,
+            toolset=toolset,
+            schema=schema,
+            handler=handler,
+            description=schema.get("description", "").split("\n")[0],
+        )
+
+    # ── Register hooks ────────────────────────────────────────────────
     ctx.register_hook("pre_llm_call", _inject_workflow_context)
+    ctx.register_hook("plugin_shutdown", _on_shutdown)
 
     # ── Register slash command ────────────────────────────────────────
     try:
@@ -271,15 +397,24 @@ def register(ctx: Any) -> None:
     # ── Register bundled skill ────────────────────────────────────────
     try:
         skills_dir = Path(__file__).parent / "skills"
-        for child in sorted(skills_dir.iterdir()):
-            skill_md = child / "SKILL.md"
-            if child.is_dir() and skill_md.exists():
-                ctx.register_skill(child.name, skill_md)
-                logger.info("Registered skill: %s", child.name)
+        if skills_dir.exists():
+            for child in sorted(skills_dir.iterdir()):
+                skill_md = child / "SKILL.md"
+                if child.is_dir() and skill_md.exists():
+                    ctx.register_skill(child.name, skill_md)
+                    logger.info("Registered skill: %s", child.name)
     except Exception:
         logger.warning("Failed to register workflow-agent skill", exc_info=True)
 
+    # ── Start the scheduler ───────────────────────────────────────────
+    try:
+        db = get_db()
+        workflows = db.list_workflows(enabled_only=True)
+        scheduler_start(workflows)
+    except Exception:
+        logger.warning("Failed to start workflow scheduler", exc_info=True)
+
     logger.info(
-        "Workflow Engine plugin registered (%d tools, 1 hook, 1 command, 1 skill)",
-        5,
+        "Workflow Engine v1.0.0 registered (%d tools, 2 hooks, 1 command, 1 skill)",
+        len(schema_map),
     )

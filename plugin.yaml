@@ -1,19 +1,26 @@
 name: workflow
-version: 0.1.9
+version: 1.0.0
 description: >-
-  Persistent workflow engine for Hermes cron agents. Adds stateful execution,
-  human-in-the-loop pause/resume, and cross-run memory without modifying
-  Hermes core. Agents remember previous runs, pause for approvals, and
-  resume with full context.
+  Workflow Engine for Hermes — create scheduled cron-like workflows
+  with persistent per-workflow state and human-in-the-loop interactions.
+  Built-in APScheduler manages cron triggers. Agents can save/load state
+  across runs, pause for human approval, and resume with full context.
 
 author: Destiny Ezenwata
 
 provides_tools:
+  - workflow_create
+  - workflow_update
+  - workflow_delete
+  - workflow_list
+  - workflow_get
   - workflow_save_state
   - workflow_load_state
+  - workflow_delete_state
   - workflow_wait_for_user
   - workflow_submit_response
   - workflow_list_pending
 
 provides_hooks:
   - pre_llm_call
+  - plugin_shutdown

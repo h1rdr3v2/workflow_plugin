@@ -1,19 +1,14 @@
-# Workflow Plugin for Hermes Agent
+# Workflow Engine Plugin for Hermes
 
-A persistent workflow/memory engine that adds **stateful execution**, **human-in-the-loop interactions**, and **cross-run memory** to Hermes cron agents.
+A first-class **workflow engine** that lets users and agents create scheduled cron-like workflows with persistent per-workflow state and human-in-the-loop interactions.
 
-## The Problem
+## What It Does
 
-Hermes cron jobs are **stateless**. Every cron execution starts as a fresh session — the agent cannot remember previous runs, ongoing workflows, assignments, pending approvals, or user interactions.
-
-## The Solution
-
-A lightweight plugin that sits alongside Hermes (no core modifications needed) and provides:
-
-- **Persistent state** — agents save/load data across cron runs via SQLite
-- **Human pause/resume** — agents pause for approval, humans respond via `/workflows`
-- **Workflow continuation** — paused workflows resume with full context on the next cron tick
-- **Task rotation tracking** — agents remember assignment history and rotate fairly
+- **Create workflows** — define a named job with a cron schedule and agent prompt, via chat or dashboard
+- **Built-in scheduler** — APScheduler manages all cron triggers, no reliance on Hermes cron
+- **Persistent state** — each workflow has its own namespaced key-value store that survives across runs
+- **Human-in-the-loop** — agents can pause mid-run and ask a human for input; the response is injected on the next tick
+- **Dashboard** — full UI for creating, editing, enabling/disabling, and monitoring workflows
 
 ## Quick Start
 
@@ -26,73 +21,108 @@ hermes plugins enable workflow
 
 # 3. Verify it loaded
 HERMES_PLUGINS_DEBUG=1 hermes plugins list
+```
 
-# 4. Give your agent a stateful cron job
-hermes cron create \
-  --name "Task Rotation" \
-  --schedule "0 9 * * *" \
-  --prompt "You are a workflow agent. Use workflow_load_state to check previous assignments, rotate tasks fairly among Alice/Bob/Carol, then use workflow_save_state to persist the updated rotation. If unsure about an assignment, use workflow_wait_for_user to ask me."
+### Creating Your First Workflow (via agent chat)
+
+```
+User: Create a workflow that rotates PR review assignments every weekday at 9am among Alice, Bob, and Carol. If you're unsure about an assignment, ask me.
+
+Agent: [calls workflow_create with appropriate params]
+
+# Or via the dashboard: open Hermes → Workflows tab → "+ New Workflow"
 ```
 
 ## Architecture
 
 ```
 ~/.hermes/plugins/workflow/
-├── plugin.yaml           # Manifest — declares tools, hooks
-├── __init__.py           # register(ctx) — wires everything
-├── db.py                 # SQLite layer (workflow_engine.db)
-├── schemas.py            # 5 LLM-visible tool definitions
-├── tools.py              # Tool handler implementations
+├── plugin.yaml              # Manifest: 11 tools, 2 hooks
+├── __init__.py              # register(ctx) — wires tools, hooks, scheduler, skill
+├── models.py                # Workflow, WorkflowRun, PendingAction dataclasses
+├── db.py                    # SQLite layer (workflow_engine.db) — 3 tables
+├── scheduler.py             # APScheduler cron loop
+├── executor.py              # Runs a single workflow tick
+├── schemas.py               # 11 LLM-visible tool definitions
+├── tools.py                 # 11 tool handler implementations
 ├── skills/
 │   └── workflow-agent/
-│       └── SKILL.md      # Teaches agents the workflow pattern
-└── dashboard/            # Dashboard UI plugin
-    ├── manifest.json     # Sidebar tab config
-    ├── plugin_api.py     # FastAPI backend routes
-    └── dist/
-        └── index.js      # React UI (IIFE, no build step)
+│       └── SKILL.md          # Teaches agents the workflow pattern
+├── dashboard/
+│   ├── manifest.json         # Sidebar tab config
+│   ├── plugin_api.py         # FastAPI backend routes
+│   └── dist/
+│       └── index.js          # React UI (IIFE, no build step)
+└── README.md
 ```
 
 ## Tools
 
-| Tool                                              | Purpose                          |
-| ------------------------------------------------- | -------------------------------- |
-| `workflow_save_state(key, value)`                 | Persist data across cron runs    |
-| `workflow_load_state(key)`                        | Retrieve saved data              |
-| `workflow_wait_for_user(workflow_id, question)`   | Pause workflow, wait for human   |
-| `workflow_submit_response(workflow_id, response)` | Human answers a pending workflow |
-| `workflow_list_pending()`                         | List workflows awaiting input    |
+| #   | Tool                       | Purpose                                              |
+| --- | -------------------------- | ---------------------------------------------------- |
+| 1   | `workflow_create`          | Create a new scheduled workflow                      |
+| 2   | `workflow_update`          | Modify a workflow (schedule, prompt, enable/disable) |
+| 3   | `workflow_delete`          | Delete a workflow and all its state                  |
+| 4   | `workflow_list`            | List all workflows with status                       |
+| 5   | `workflow_get`             | Get full details of a workflow + state + pending     |
+| 6   | `workflow_save_state`      | Persist a key-value pair for the current workflow    |
+| 7   | `workflow_load_state`      | Retrieve a saved state value                         |
+| 8   | `workflow_delete_state`    | Remove a state key                                   |
+| 9   | `workflow_wait_for_user`   | Pause and ask a human a question                     |
+| 10  | `workflow_submit_response` | Human answers a pending question                     |
+| 11  | `workflow_list_pending`    | List all pending human-input requests                |
+
+## Hooks
+
+| Hook              | Purpose                                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| `pre_llm_call`    | Injects workflow state + pending/resolved responses into agent context at the start of each run |
+| `plugin_shutdown` | Gracefully stops the APScheduler                                                                |
 
 ## Human Interface
 
-- `/workflows` — list all pending workflows
-- `/workflows respond <id> <answer>` — respond to a pending workflow
-- `/workflows dismiss <id>` — dismiss a pending workflow without responding
+- **`/workflows`** — list all workflows and pending actions
+- **`/workflows respond <action_id> <answer>`** — respond to a pending question
+- **`/workflows dismiss <action_id>`** — dismiss without responding
+- **Dashboard tab** — full CRUD, state inspection, pending action management
 
-## How It Works
+## Execution Flow
 
-1. **On each cron run**, the `pre_llm_call` hook injects saved state and pending human responses into the agent's context
-2. **The agent** loads previous state, makes decisions, saves new state
-3. **If stuck**, the agent calls `workflow_wait_for_user()` and the job ends
-4. **A human** reviews pending workflows via `/workflows` and submits a response
-5. **On the next cron run**, the agent sees the human's response and continues
+```
+Scheduler triggers cron tick
+  → Load workflow definition + saved state + resolved responses
+    → Build enriched agent prompt
+      → Agent runs, calling tools (load_state, save_state, wait_for_user, etc.)
+        → Run recorded as: success | paused (awaiting human) | error
+```
+
+- **Overlap protection**: if a workflow has an unresolved pending action, the scheduler skips the tick (workflow is effectively "paused")
+- **Manual trigger**: you can run any workflow ad-hoc via the dashboard or API without waiting for its cron schedule
 
 ## Database
 
 State is stored in `~/.hermes/workflow_engine.db` (SQLite, WAL mode):
 
-- `workflow_state` — JSON key-value store
-- `pending_actions` — tracks workflows awaiting human input
+| Table             | Purpose                                                                  |
+| ----------------- | ------------------------------------------------------------------------ |
+| `workflows`       | Workflow definitions (id, name, cron, prompt, enabled)                   |
+| `workflow_state`  | Per-workflow key-value store (workflow_id, key, value)                   |
+| `pending_actions` | Human-in-the-loop requests (id, workflow_id, question, status, response) |
+
+All state is scoped by `workflow_id` — each workflow has its own logical namespace.
 
 ## Requirements
 
-- Hermes Agent (any version that supports plugins)
-- Python 3.10+ with `sqlite3` (bundled with Python)
+- Hermes Agent (plugin-capable version)
+- Python 3.10+
+- `apscheduler` (`pip install apscheduler`)
+- `sqlite3` (bundled with Python)
 
 ## Design Decisions
 
-- **Separate database** from Hermes core `state.db` — no coupling, easy to evolve
-- **JSON serialization** — flexible enough for any workflow shape without schema migrations
-- **`pre_llm_call` hook** — follows Hermes's documented context injection pattern
-- **No core modifications** — uses only public `ctx.register_*` APIs
-- **Thread-safe** — uses same BEGIN IMMEDIATE + jitter retry pattern as Hermes's own SessionDB
+- **Built-in scheduler** via APScheduler — workflows don't depend on Hermes cron jobs
+- **Single SQLite DB** with per-workflow namespacing — simple, portable, no external dependencies
+- **Overlap protection** — a workflow with an unresolved pending action won't trigger again until resolved
+- **Thread-safe** — same BEGIN IMMEDIATE + jitter retry pattern as Hermes's own SessionDB
+- **JSON state values** — flexible enough for any workflow shape without schema migrations
+- **All state auto-injected** — agents don't need to manually call `load_state` for every key; the `pre_llm_call` hook injects state context automatically

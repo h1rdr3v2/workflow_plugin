@@ -1,27 +1,33 @@
 """
 Workflow Engine Database Layer.
 
-Provides a lightweight SQLite-backed persistent store for workflow state
-and pending human-in-the-loop actions. Operates independently of Hermes
-core's state.db to avoid coupling.
-
-Design follows Hermes's own SessionDB patterns:
-- WAL mode for concurrent reads
-- BEGIN IMMEDIATE with jitter retry for write contention
-- sqlite3.Row factory for dict-like row access
-- Thread-safe via threading.Lock
+SQLite-backed persistent store for workflows, per-workflow state,
+and human-in-the-loop pending actions.
 
 Database: ~/.hermes/workflow_engine.db
+Tables:
+  - workflows       — workflow definitions (id, name, cron, prompt, enabled)
+  - workflow_state  — per-workflow key-value store (workflow_id, key, value)
+  - pending_actions — human-in-the-loop requests (id, workflow_id, question, status)
+
+Design:
+  - WAL mode for concurrent reads
+  - BEGIN IMMEDIATE with jitter retry for write contention
+  - sqlite3.Row factory for dict-like row access
+  - Thread-safe via threading.Lock
+  - All CRUD operations return dicts or dataclass-compatible rows
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -30,13 +36,11 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # ---------------------------------------------------------------------------
-# Database location — resolves ~/.hermes dynamically
+# Database location
 # ---------------------------------------------------------------------------
 
 
 def _get_hermes_home() -> Path:
-    """Resolve Hermes home directory."""
-    import os
     val = (os.environ.get("HERMES_HOME") or "").strip()
     return Path(val) if val else Path.home() / ".hermes"
 
@@ -48,29 +52,48 @@ DEFAULT_DB_PATH = _get_hermes_home() / "workflow_engine.db"
 # ---------------------------------------------------------------------------
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS workflows (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    cron_expression TEXT NOT NULL,
+    prompt          TEXT NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workflow_state (
-    key         TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    key         TEXT NOT NULL,
     value       TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (workflow_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS pending_actions (
-    workflow_id   TEXT PRIMARY KEY,
-    cron_job_id   TEXT,
-    question      TEXT NOT NULL,
-    context       TEXT,
-    status        TEXT NOT NULL DEFAULT 'pending',
-    created_at    REAL NOT NULL,
-    response      TEXT,
-    responded_at  REAL
+    id           TEXT PRIMARY KEY,
+    workflow_id  TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    run_id       TEXT,
+    question     TEXT NOT NULL,
+    context      TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    response     TEXT,
+    created_at   REAL NOT NULL,
+    responded_at REAL
 );
+
+CREATE INDEX IF NOT EXISTS idx_workflow_state_wf
+    ON workflow_state(workflow_id);
+
+CREATE INDEX IF NOT EXISTS idx_pending_workflow
+    ON pending_actions(workflow_id);
 
 CREATE INDEX IF NOT EXISTS idx_pending_status
     ON pending_actions(status);
 
-CREATE INDEX IF NOT EXISTS idx_pending_cron_job
-    ON pending_actions(cron_job_id);
+CREATE INDEX IF NOT EXISTS idx_pending_run
+    ON pending_actions(run_id);
 """
 
 
@@ -78,17 +101,17 @@ CREATE INDEX IF NOT EXISTS idx_pending_cron_job
 # WorkflowDB
 # ---------------------------------------------------------------------------
 
+
 class WorkflowDB:
     """
-    SQLite-backed store for workflow state and pending human interactions.
+    SQLite-backed store for the Workflow Engine.
 
-    Thread-safe: uses a re-entrant lock + jitter-retry write pattern.
+    Thread-safe: re-entrant lock + jitter-retry write pattern.
     """
 
-    # Write-contention tuning (mirrors Hermes SessionDB)
     _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20 ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150 ms
+    _WRITE_RETRY_MIN_S = 0.020
+    _WRITE_RETRY_MAX_S = 0.150
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -99,30 +122,27 @@ class WorkflowDB:
             str(self.db_path),
             check_same_thread=False,
             timeout=1.0,
-            isolation_level=None,  # we manage transactions ourselves
+            isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
 
-        # Enable WAL mode with fallback
         try:
             self._conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
-            logger.warning("WAL mode unavailable for workflow_engine.db; using default journal")
+            logger.warning("WAL mode unavailable; using default journal")
 
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
 
-    # ── Schema init ──────────────────────────────────────────────────────
+    # ── Schema init ──────────────────────────────────────────────────
 
     def _init_schema(self) -> None:
-        """Create tables if they don't exist."""
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
 
-    # ── Write helper ─────────────────────────────────────────────────────
+    # ── Write helper ─────────────────────────────────────────────────
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry."""
         last_err: Optional[Exception] = None
         for _attempt in range(self._WRITE_MAX_RETRIES):
             try:
@@ -144,187 +164,414 @@ class WorkflowDB:
                 time.sleep(jitter)
         raise last_err  # type: ignore[misc]
 
-    # ── State CRUD ───────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # Workflow CRUD
+    # ══════════════════════════════════════════════════════════════════
 
-    def save_state(self, key: str, value: Any) -> None:
-        """
-        Persist a workflow state value under *key*.
+    def create_workflow(
+        self,
+        workflow_id: str,
+        name: str,
+        cron_expression: str,
+        prompt: str,
+        description: str = "",
+    ) -> Dict[str, Any]:
+        """Create a new workflow. Raises ValueError if id already exists."""
+        now = time.time()
 
-        *value* is JSON-serialized before storage. Overwrites any
-        existing value for the same key.
+        def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
+            try:
+                conn.execute(
+                    """INSERT INTO workflows (id, name, description, cron_expression, prompt, enabled, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+                    (workflow_id, name, description, cron_expression, prompt, now, now),
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError(f"Workflow '{workflow_id}' already exists")
+            return {
+                "id": workflow_id,
+                "name": name,
+                "description": description,
+                "cron_expression": cron_expression,
+                "prompt": prompt,
+                "enabled": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        result = self._execute_write(_do)
+        logger.info("Workflow created: id=%s", workflow_id)
+        return result
+
+    def get_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single workflow by id."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_workflows(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        """List all workflows, optionally filtering to enabled only."""
+        with self._lock:
+            if enabled_only:
+                rows = self._conn.execute(
+                    "SELECT * FROM workflows WHERE enabled = 1 ORDER BY name"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM workflows ORDER BY name"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_workflow(
+        self,
+        workflow_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        cron_expression: Optional[str] = None,
+        prompt: Optional[str] = None,
+        enabled: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update fields on an existing workflow. Returns updated row or None."""
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+            existing = conn.execute(
+                "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+
+            updates: List[str] = []
+            params: List[Any] = []
+
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if cron_expression is not None:
+                updates.append("cron_expression = ?")
+                params.append(cron_expression)
+            if prompt is not None:
+                updates.append("prompt = ?")
+                params.append(prompt)
+            if enabled is not None:
+                updates.append("enabled = ?")
+                params.append(1 if enabled else 0)
+
+            if not updates:
+                return dict(existing)
+
+            updates.append("updated_at = ?")
+            params.append(now)
+            params.append(workflow_id)
+
+            conn.execute(
+                f"UPDATE workflows SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            # Return the full updated row
+            updated = conn.execute(
+                "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            return dict(updated) if updated else None
+
+        result = self._execute_write(_do)
+        if result:
+            logger.info("Workflow updated: id=%s", workflow_id)
+        return result
+
+    def delete_workflow(self, workflow_id: str) -> bool:
         """
+        Delete a workflow and all its state + pending actions (CASCADE).
+        Returns True if the workflow existed.
+        """
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
+            return cursor.rowcount > 0
+
+        result = self._execute_write(_do)
+        if result:
+            logger.info("Workflow deleted: id=%s", workflow_id)
+        return result
+
+    def workflow_exists(self, workflow_id: str) -> bool:
+        """Check if a workflow exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)
+            ).fetchone()
+        return row is not None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Workflow State (per-workflow key-value)
+    # ══════════════════════════════════════════════════════════════════
+
+    def save_state(self, workflow_id: str, key: str, value: Any) -> None:
+        """Persist a key-value pair scoped to a workflow. JSON-serialized."""
         now = time.time()
         serialized = json.dumps(value)
 
         def _do(conn: sqlite3.Connection) -> None:
             conn.execute(
-                """INSERT INTO workflow_state (key, value, created_at, updated_at)
+                """INSERT INTO workflow_state (workflow_id, key, value, updated_at)
                    VALUES (?, ?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET
+                   ON CONFLICT(workflow_id, key) DO UPDATE SET
                        value = excluded.value,
                        updated_at = excluded.updated_at""",
-                (key, serialized, now, now),
+                (workflow_id, key, serialized, now),
             )
-        self._execute_write(_do)
-        logger.debug("Workflow state saved: key=%s", key)
 
-    def load_state(self, key: str) -> Optional[Any]:
-        """Load a workflow state value by *key*. Returns None if not found."""
+        self._execute_write(_do)
+        logger.debug("State saved: workflow=%s key=%s", workflow_id, key)
+
+    def load_state(self, workflow_id: str, key: str) -> Optional[Any]:
+        """Load a state value for a workflow. Returns None if not found."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT value FROM workflow_state WHERE key = ?", (key,)
+                "SELECT value FROM workflow_state WHERE workflow_id = ? AND key = ?",
+                (workflow_id, key),
             ).fetchone()
         if row is None:
             return None
         try:
             return json.loads(row["value"])
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Corrupted state for key=%s, returning raw string", key)
+            logger.warning("Corrupted state: workflow=%s key=%s", workflow_id, key)
             return row["value"]
 
-    def delete_state(self, key: str) -> bool:
-        """Delete a workflow state entry. Returns True if it existed."""
+    def delete_state(self, workflow_id: str, key: str) -> bool:
+        """Delete a state entry. Returns True if it existed."""
 
         def _do(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
-                "DELETE FROM workflow_state WHERE key = ?", (key,)
+                "DELETE FROM workflow_state WHERE workflow_id = ? AND key = ?",
+                (workflow_id, key),
             )
             return cursor.rowcount > 0
+
         return self._execute_write(_do)
 
-    def list_state_keys(self, prefix: Optional[str] = None) -> List[str]:
-        """List all state keys, optionally filtered by prefix."""
+    def list_state_keys(self, workflow_id: str) -> List[str]:
+        """List all state keys for a workflow."""
         with self._lock:
-            if prefix:
-                escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                rows = self._conn.execute(
-                    "SELECT key FROM workflow_state WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
-                    (f"{escaped}%",),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT key FROM workflow_state ORDER BY key"
-                ).fetchall()
+            rows = self._conn.execute(
+                "SELECT key FROM workflow_state WHERE workflow_id = ? ORDER BY key",
+                (workflow_id,),
+            ).fetchall()
         return [r["key"] for r in rows]
 
-    # ── Pending Actions ──────────────────────────────────────────────────
+    def load_all_state(self, workflow_id: str) -> Dict[str, Any]:
+        """Load all state key-value pairs for a workflow as a dict."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM workflow_state WHERE workflow_id = ? ORDER BY key",
+                (workflow_id,),
+            ).fetchall()
+        result: Dict[str, Any] = {}
+        for r in rows:
+            try:
+                result[r["key"]] = json.loads(r["value"])
+            except (json.JSONDecodeError, TypeError):
+                result[r["key"]] = r["value"]
+        return result
+
+    # ══════════════════════════════════════════════════════════════════
+    # Workflow Runs
+    # ══════════════════════════════════════════════════════════════════
+
+    def create_run(
+        self,
+        workflow_id: str,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Record the start of a workflow execution.
+        Returns the run dict. Does NOT persist to a table — runs are
+        tracked in-memory via the scheduler. This method exists as a
+        future hook for persisting run history.
+
+        For now, returns a lightweight run tracking dict.
+        """
+        rid = run_id or str(uuid.uuid4())
+        now = time.time()
+        return {
+            "id": rid,
+            "workflow_id": workflow_id,
+            "status": "running",
+            "started_at": now,
+            "finished_at": None,
+            "pending_action_id": None,
+            "error_message": None,
+            "output_summary": None,
+        }
+
+    def get_active_run(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if there's an active (running/paused) run for a workflow.
+        Used by the scheduler to prevent overlapping executions.
+
+        Since runs are not persisted to a table yet, we check pending_actions
+        for unresolved actions tied to this workflow as a proxy for "paused" state.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT 1 FROM pending_actions
+                   WHERE workflow_id = ? AND status = 'pending'
+                   LIMIT 1""",
+                (workflow_id,),
+            ).fetchone()
+        # If there's a pending action, the workflow is effectively "paused"
+        if row:
+            return {
+                "id": "paused",
+                "workflow_id": workflow_id,
+                "status": "paused",
+                "started_at": 0.0,
+            }
+        return None
+
+    # ══════════════════════════════════════════════════════════════════
+    # Pending Actions (human-in-the-loop)
+    # ══════════════════════════════════════════════════════════════════
 
     def create_pending_action(
         self,
         workflow_id: str,
         question: str,
-        cron_job_id: Optional[str] = None,
+        run_id: Optional[str] = None,
         context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Record a workflow that needs human input before continuing.
-
-        Returns the created action dict.
-        """
+        """Create a human-in-the-loop question for a workflow."""
         now = time.time()
-        action = {
-            "workflow_id": workflow_id,
-            "cron_job_id": cron_job_id,
-            "question": question,
-            "context": context,
-            "status": "pending",
-            "created_at": now,
-            "response": None,
-            "responded_at": None,
-        }
+        action_id = str(uuid.uuid4())
 
         def _do(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """INSERT INTO pending_actions
-                   (workflow_id, cron_job_id, question, context, status, created_at)
-                   VALUES (?, ?, ?, ?, 'pending', ?)
-                   ON CONFLICT(workflow_id) DO UPDATE SET
-                       question = excluded.question,
-                       context = excluded.context,
-                       status = 'pending',
-                       created_at = excluded.created_at,
-                       response = NULL,
-                       responded_at = NULL""",
-                (workflow_id, cron_job_id, question, context, now),
+                   (id, workflow_id, run_id, question, context, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                (action_id, workflow_id, run_id, question, context, now),
             )
-        self._execute_write(_do)
-        logger.info("Pending action created: workflow_id=%s", workflow_id)
-        return action
 
-    def get_pending_action(self, workflow_id: str) -> Optional[Dict[str, Any]]:
-        """Get a single pending action by workflow_id."""
+        self._execute_write(_do)
+        logger.info("Pending action created: id=%s workflow=%s", action_id, workflow_id)
+        return {
+            "id": action_id,
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "question": question,
+            "context": context,
+            "status": "pending",
+            "response": None,
+            "created_at": now,
+            "responded_at": None,
+        }
+
+    def get_pending_action(self, action_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single pending action by id."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM pending_actions WHERE workflow_id = ?", (workflow_id,)
+                "SELECT * FROM pending_actions WHERE id = ?", (action_id,)
             ).fetchone()
         return dict(row) if row else None
 
     def list_pending_actions(
-        self, status: Optional[str] = "pending", cron_job_id: Optional[str] = None
+        self,
+        workflow_id: Optional[str] = None,
+        status: str = "pending",
     ) -> List[Dict[str, Any]]:
-        """List pending actions, optionally filtered by status and cron_job_id."""
+        """List pending actions, optionally filtered by workflow_id and status."""
         with self._lock:
-            if cron_job_id and status:
+            if workflow_id:
                 rows = self._conn.execute(
-                    "SELECT * FROM pending_actions WHERE status = ? AND cron_job_id = ? ORDER BY created_at DESC",
-                    (status, cron_job_id),
+                    "SELECT * FROM pending_actions WHERE workflow_id = ? AND status = ? ORDER BY created_at DESC",
+                    (workflow_id, status),
                 ).fetchall()
-            elif status:
+            else:
                 rows = self._conn.execute(
                     "SELECT * FROM pending_actions WHERE status = ? ORDER BY created_at DESC",
                     (status,),
                 ).fetchall()
-            elif cron_job_id:
-                rows = self._conn.execute(
-                    "SELECT * FROM pending_actions WHERE cron_job_id = ? ORDER BY created_at DESC",
-                    (cron_job_id,),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM pending_actions ORDER BY created_at DESC"
-                ).fetchall()
         return [dict(r) for r in rows]
 
     def resolve_pending_action(
-        self, workflow_id: str, response: str
+        self, action_id: str, response: str
     ) -> Optional[Dict[str, Any]]:
-        """
-        Record a human response to a pending workflow.
-
-        Returns the updated action dict, or None if not found.
-        """
+        """Record a human response to a pending action."""
         now = time.time()
 
         def _do(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
-            cursor = conn.execute(
-                "SELECT * FROM pending_actions WHERE workflow_id = ?", (workflow_id,)
-            )
-            row = cursor.fetchone()
-            if row is None:
+            existing = conn.execute(
+                "SELECT * FROM pending_actions WHERE id = ?", (action_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+            if existing["status"] != "pending":
                 return None
             conn.execute(
                 """UPDATE pending_actions
                    SET status = 'resolved', response = ?, responded_at = ?
-                   WHERE workflow_id = ?""",
-                (response, now, workflow_id),
+                   WHERE id = ?""",
+                (response, now, action_id),
             )
-            return dict(row) | {"status": "resolved", "response": response, "responded_at": now}
+            return dict(existing) | {
+                "status": "resolved",
+                "response": response,
+                "responded_at": now,
+            }
 
         result = self._execute_write(_do)
         if result:
-            logger.info("Pending action resolved: workflow_id=%s", workflow_id)
+            logger.info("Pending action resolved: id=%s", action_id)
         return result
 
-    def delete_pending_action(self, workflow_id: str) -> bool:
-        """Delete a pending action entirely."""
+    def dismiss_pending_action(self, action_id: str) -> bool:
+        """Dismiss a pending action without a response."""
+
         def _do(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
-                "DELETE FROM pending_actions WHERE workflow_id = ?", (workflow_id,)
+                """UPDATE pending_actions SET status = 'dismissed', responded_at = ?
+                   WHERE id = ? AND status = 'pending'""",
+                (time.time(), action_id),
             )
             return cursor.rowcount > 0
+
         return self._execute_write(_do)
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    def delete_pending_action(self, action_id: str) -> bool:
+        """Hard-delete a pending action."""
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("DELETE FROM pending_actions WHERE id = ?", (action_id,))
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def get_resolved_since(
+        self, workflow_id: str, since: float
+    ) -> List[Dict[str, Any]]:
+        """
+        Get pending actions that were resolved since a given timestamp.
+        Used by the executor to inject recent human responses into the
+        next workflow run.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM pending_actions
+                   WHERE workflow_id = ? AND status = 'resolved' AND responded_at > ?
+                   ORDER BY responded_at ASC""",
+                (workflow_id, since),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ══════════════════════════════════════════════════════════════════
+    # Lifecycle
+    # ══════════════════════════════════════════════════════════════════
 
     def close(self) -> None:
         """Close the database connection."""
@@ -345,7 +592,7 @@ class WorkflowDB:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton (lazy-initialized)
+# Module-level singleton
 # ---------------------------------------------------------------------------
 
 _db: Optional[WorkflowDB] = None
