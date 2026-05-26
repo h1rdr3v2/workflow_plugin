@@ -3,7 +3,7 @@
 	"label": "Workflows",
 	"description": "Create and manage scheduled workflows with persistent state and human-in-the-loop interactions.",
 	"icon": "Activity",
-	"version": "1.0.0",
+	"version": "0.1.10",
 	"tab": {
 		"path": "/workflows",
 		"position": "after:cron"
