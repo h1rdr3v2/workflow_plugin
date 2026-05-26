@@ -39,7 +39,6 @@
 	var TabsList = C.TabsList
 	var TabsTrigger = C.TabsTrigger
 	var Separator = C.Separator
-	// NOTE: 'Spinner' is NOT in the documented SDK — use inline loading below.
 
 	var fetchJSON = SDK.fetchJSON
 	var cn = SDK.utils.cn
@@ -117,9 +116,30 @@
 		return React.createElement(
 			"div",
 			{ className: "flex flex-wrap gap-3 mb-4" },
-			React.createElement(Badge, null, stats.pending_workflows + " pending"),
-			React.createElement(Badge, null, stats.resolved_workflows + " resolved"),
-			React.createElement(Badge, null, stats.state_keys + " state keys"),
+			React.createElement(
+				"span",
+				{
+					className:
+						"inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold",
+				},
+				stats.pending_workflows + " pending",
+			),
+			React.createElement(
+				"span",
+				{
+					className:
+						"inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold",
+				},
+				stats.resolved_workflows + " resolved",
+			),
+			React.createElement(
+				"span",
+				{
+					className:
+						"inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold",
+				},
+				stats.state_keys + " state keys",
+			),
 		)
 	}
 
@@ -562,73 +582,80 @@
 			),
 			React.createElement(StatsBar, { stats: statsData }),
 
+			// Simple tab bar using plain HTML buttons (avoids Tabs SDK mismatches)
 			React.createElement(
-				Tabs,
-				{ value: tab, onChange: setTab },
-				React.createElement(
-					TabsList,
-					null,
-					React.createElement(
-						TabsTrigger,
-						{ value: "pending" },
-						"Pending (" + pending.length + ")",
-					),
-					React.createElement(
-						TabsTrigger,
-						{ value: "resolved" },
-						"Resolved (" + resolved.length + ")",
-					),
-					React.createElement(
-						TabsTrigger,
-						{ value: "state" },
-						"State (" + keys.length + ")",
-					),
-				),
-				React.createElement(Separator, { className: "my-3" }),
-
-				// Pending tab
-				tab === "pending" &&
-					React.createElement(
-						"div",
-						null,
-						pending.length === 0
-							? React.createElement(
-									"p",
-									{ className: "text-sm text-text-tertiary py-8 text-center" },
-									"No pending workflows. Agents will create pending actions when they call workflow_wait_for_user().",
-								)
-							: pending.map(function (action) {
-									return React.createElement(PendingCard, {
-										key: action.workflow_id,
-										action: action,
-										onRefresh: loadAll,
-									})
-								}),
-					),
-
-				// Resolved tab
-				tab === "resolved" &&
-					React.createElement(
-						"div",
-						null,
-						resolved.length === 0
-							? React.createElement(
-									"p",
-									{ className: "text-sm text-text-tertiary py-8 text-center" },
-									"No resolved workflows yet.",
-								)
-							: resolved.map(function (action) {
-									return React.createElement(ResolvedCard, {
-										key: action.workflow_id,
-										action: action,
-									})
-								}),
-					),
-
-				// State tab
-				tab === "state" &&
-					React.createElement(StatePanel, { keys: keys, onRefresh: loadAll }),
+				"div",
+				{ className: "flex gap-1 mb-3 border-b border-border pb-2" },
+				["pending", "resolved", "state"].map(function (t) {
+					var counts = {
+						pending: pending.length,
+						resolved: resolved.length,
+						state: keys.length,
+					}
+					var labels = {
+						pending: "Pending",
+						resolved: "Resolved",
+						state: "State",
+					}
+					return React.createElement(
+						"button",
+						{
+							key: t,
+							onClick: function () {
+								setTab(t)
+							},
+							className:
+								tab === t
+									? "px-3 py-1 text-sm font-medium border-b-2 border-primary text-primary"
+									: "px-3 py-1 text-sm text-text-tertiary hover:text-text-secondary",
+						},
+						labels[t] + " (" + counts[t] + ")",
+					)
+				}),
 			),
+
+			// Pending tab
+			tab === "pending" &&
+				React.createElement(
+					"div",
+					null,
+					pending.length === 0
+						? React.createElement(
+								"p",
+								{ className: "text-sm text-text-tertiary py-8 text-center" },
+								"No pending workflows.",
+							)
+						: pending.map(function (action) {
+								return React.createElement(PendingCard, {
+									key: action.workflow_id,
+									action: action,
+									onRefresh: loadAll,
+								})
+							}),
+				),
+
+			// Resolved tab
+			tab === "resolved" &&
+				React.createElement(
+					"div",
+					null,
+					resolved.length === 0
+						? React.createElement(
+								"p",
+								{ className: "text-sm text-text-tertiary py-8 text-center" },
+								"No resolved workflows yet.",
+							)
+						: resolved.map(function (action) {
+								return React.createElement(ResolvedCard, {
+									key: action.workflow_id,
+									action: action,
+								})
+							}),
+				),
+
+			// State tab
+			tab === "state" &&
+				React.createElement(StatePanel, { keys: keys, onRefresh: loadAll }),
 		)
 	}
 
