@@ -1,5 +1,5 @@
 name: workflow
-version: 0.1.5
+version: 0.1.6
 description: >-
   Persistent workflow engine for Hermes cron agents. Adds stateful execution,
   human-in-the-loop pause/resume, and cross-run memory without modifying
