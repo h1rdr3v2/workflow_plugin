@@ -3,7 +3,7 @@
 	"label": "Workflows",
 	"description": "Manage pending workflow approvals, view state history, and respond to paused agent workflows.",
 	"icon": "Activity",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"tab": {
 		"path": "/workflows",
 		"position": "after:cron"
