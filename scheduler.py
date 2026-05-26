@@ -15,11 +15,28 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, Optional
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.jobstores.base import JobLookupError
-
 logger = logging.getLogger(__name__)
+
+# ── Lazy import apscheduler — degrade gracefully if not installed ─────────
+
+_apscheduler_missing: Optional[str] = None
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler  # noqa: F811
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.jobstores.base import JobLookupError
+
+    _HAS_APSCHEDULER = True
+except ImportError as e:
+    _HAS_APSCHEDULER = False
+    _apscheduler_missing = (
+        f"APScheduler is not installed ({e}). "
+        f"Install it with: pip install apscheduler"
+    )
+    # Define stubs so the module can still be imported
+    BackgroundScheduler = None  # type: ignore[misc]
+    CronTrigger = None  # type: ignore[misc]
+    JobLookupError = Exception  # type: ignore[misc]
 
 # Reference to the executor — set at registration time
 _executor: Optional[Callable[[str], None]] = None
@@ -38,6 +55,9 @@ _scheduler: Optional[BackgroundScheduler] = None
 
 def get_scheduler() -> BackgroundScheduler:
     """Get or create the BackgroundScheduler singleton."""
+    if not _HAS_APSCHEDULER:
+        raise RuntimeError(_apscheduler_missing)
+
     global _scheduler
     if _scheduler is not None:
         return _scheduler
@@ -67,6 +87,9 @@ def schedule_workflow(workflow: Dict[str, Any]) -> None:
     Add or update a cron job for a given workflow.
     The job will call the executor with the workflow_id.
     """
+    if not _HAS_APSCHEDULER:
+        logger.warning("Cannot schedule workflow '%s': %s", workflow.get("id", "?"), _apscheduler_missing)
+        return
     scheduler = get_scheduler()
     jid = _job_id(workflow["id"])
 
@@ -162,6 +185,12 @@ def start(workflows: list) -> None:
     Start the scheduler and schedule all enabled workflows.
     Call once during plugin registration.
     """
+    if not _HAS_APSCHEDULER:
+        logger.warning(
+            "Workflow scheduler NOT started: %s",
+            _apscheduler_missing,
+        )
+        return
     sched = get_scheduler()
     if not sched.running:
         sched.start()
@@ -180,6 +209,8 @@ def shutdown(wait: bool = True) -> None:
 
 def get_jobs_status() -> list:
     """Return the status of all scheduled jobs for the dashboard."""
+    if not _HAS_APSCHEDULER:
+        return []
     sched = get_scheduler()
     jobs = []
     for job in sched.get_jobs():
