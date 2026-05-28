@@ -262,12 +262,13 @@ WORKFLOW_WAIT_FOR_USER = {
         "Pause the CURRENT workflow and wait for a human to provide input. "
         "Use this when you need approval, clarification, or a decision only "
         "a human can make.\n\n"
+        "The human can reply directly in the chat where this workflow was "
+        "created, or use the /workflows slash command. Their freeform text "
+        "response will be captured automatically.\n\n"
+        "Optionally set max_wait_seconds to auto-continue if the human "
+        "doesn't respond in time.\n\n"
         "CRITICAL: After calling this, you MUST end the current run. The "
-        "workflow will resume on the next scheduled tick once the human "
-        "responds. Do NOT continue processing after calling this.\n\n"
-        "The human can respond via the Workflows dashboard or the "
-        "/workflows slash command. Their response will be injected into "
-        "the next run's context automatically."
+        "workflow will resume immediately once the human responds."
     ),
     "parameters": {
         "type": "object",
@@ -278,7 +279,16 @@ WORKFLOW_WAIT_FOR_USER = {
             },
             "context": {
                 "type": "string",
-                "description": "Optional: additional context to help the human understand the situation. Can be a JSON string with structured data or plain text. Include relevant state, options, and reasoning.",
+                "description": "Optional: additional context to help the human understand the situation. Can be a JSON string with structured data or plain text.",
+            },
+            "max_wait_seconds": {
+                "type": "integer",
+                "description": (
+                    "Optional: maximum time in seconds to wait for human input. "
+                    "If the human doesn't respond within this time, the pending "
+                    "action is auto-dismissed and the workflow continues on its "
+                    "next tick with a timeout notice. Omit for no timeout."
+                ),
             },
         },
         "required": ["question"],

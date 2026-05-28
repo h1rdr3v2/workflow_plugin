@@ -1,5 +1,5 @@
 name: workflow
-version: 0.1.15
+version: 0.1.16
 description: >-
   Workflow Engine for Hermes — create scheduled cron-like workflows
   with persistent per-workflow state and human-in-the-loop interactions.
@@ -23,4 +23,5 @@ provides_tools:
 
 provides_hooks:
   - pre_llm_call
+  - pre_gateway_dispatch
   - plugin_shutdown

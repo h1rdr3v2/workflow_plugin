@@ -177,6 +177,97 @@ def _tick(workflow_id: str) -> None:
         logger.exception("Unhandled error in executor for workflow '%s'", workflow_id)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Timeout checker & immediate trigger — human-in-the-loop support
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Reference to the gateway runner — set via set_gateway_ref() so the
+# pre_gateway_dispatch hook and timeout checker can access platform adapters.
+_gateway_ref: Any = None
+
+
+def set_gateway_ref(gateway: Any) -> None:
+    """Store a reference to the GatewayRunner for message delivery."""
+    global _gateway_ref
+    _gateway_ref = gateway
+
+
+def trigger_workflow_now(workflow_id: str) -> bool:
+    """
+    Trigger a workflow execution immediately, bypassing the cron schedule.
+
+    Called when a human responds to a pending action — we don't want to
+    wait for the next cron tick. The overlap protection still applies:
+    if a run is already active (another pending action unresolved), skip.
+    """
+    if _executor is None:
+        logger.warning(
+            "trigger_workflow_now for '%s' but no executor registered",
+            workflow_id,
+        )
+        return False
+
+    logger.info("Immediate trigger: %s", workflow_id)
+    try:
+        _executor(workflow_id)
+        return True
+    except Exception:
+        logger.exception(
+            "Unhandled error in immediate trigger for workflow '%s'",
+            workflow_id,
+        )
+        return False
+
+
+def _timeout_checker() -> None:
+    """
+    Periodically check for expired pending actions and auto-dismiss them.
+
+    When an action expires, the associated workflow is triggered immediately
+    so the agent can continue without the human's input.
+    """
+    try:
+        from .db import get_db
+        db = get_db()
+        expired = db.get_expired_actions()
+
+        for action in expired:
+            db.expire_action(action["id"])
+            wf_id = action["workflow_id"]
+            logger.info(
+                "Timeout: action %s for workflow '%s' expired — triggering immediately",
+                action["id"],
+                wf_id,
+            )
+            trigger_workflow_now(wf_id)
+
+        if expired:
+            logger.info("Timeout checker: auto-expired %d pending action(s)", len(expired))
+    except Exception:
+        logger.exception("Timeout checker failed")
+
+
+def shutdown() -> None:
+    """Gracefully shut down the scheduler. Called by plugin_shutdown hook."""
+    if _scheduler is not None and getattr(_scheduler, "running", False):
+        _scheduler.shutdown(wait=False)
+        logger.info("Workflow scheduler shut down")
+
+
+def get_jobs_status() -> list:
+    """Return a list of scheduled job info dicts for the dashboard API."""
+    if not _HAS_APSCHEDULER or _scheduler is None:
+        return []
+    jobs = []
+    for job in _scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+        })
+    return jobs
+
+
 # ── Scheduler lifecycle ───────────────────────────────────────────────────
 
 
@@ -196,6 +287,20 @@ def start(workflows: list) -> None:
         sched.start()
         logger.info("Workflow scheduler started")
     schedule_all_workflows(workflows)
+
+    # Add the timeout checker — runs every 30 seconds
+    try:
+        from apscheduler.triggers.interval import IntervalTrigger
+        sched.add_job(
+            _timeout_checker,
+            trigger=IntervalTrigger(seconds=30),
+            id="workflow:__timeout_checker__",
+            name="Workflow timeout checker",
+            replace_existing=True,
+        )
+        logger.info("Timeout checker scheduled (every 30s)")
+    except Exception:
+        logger.warning("Could not schedule timeout checker", exc_info=True)
 
 
 def shutdown(wait: bool = True) -> None:

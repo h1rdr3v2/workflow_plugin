@@ -105,6 +105,7 @@ def get_workflow(workflow_id: str) -> dict:
                 "id": pa["id"],
                 "question": pa["question"],
                 "context": pa.get("context"),
+                "expires_at": pa.get("expires_at"),
                 "created_at": pa["created_at"],
             }
             for pa in pending
@@ -274,6 +275,7 @@ def list_pending(workflow_id: str | None = None) -> dict:
                 "workflow_id": a["workflow_id"],
                 "question": a["question"],
                 "context": a.get("context"),
+                "expires_at": a.get("expires_at"),
                 "created_at": a["created_at"],
             }
             for a in pending
@@ -308,11 +310,22 @@ async def respond_to_pending(action_id: str, request: Request) -> dict:
     if result is None:
         return {"error": f"No pending action found with ID '{action_id}'"}
 
+    # Trigger the workflow immediately — don't wait for next cron tick
+    try:
+        import sys
+        _plugin_root = Path(__file__).resolve().parent.parent
+        if str(_plugin_root) not in sys.path:
+            sys.path.insert(0, str(_plugin_root))
+        from scheduler import trigger_workflow_now
+        trigger_workflow_now(result["workflow_id"])
+    except Exception:
+        pass  # Best-effort; response is already recorded
+
     return {
         "success": True,
         "action_id": action_id,
         "workflow_id": result["workflow_id"],
-        "message": "Response submitted. The workflow will see it on the next run.",
+        "message": "Response submitted. The workflow will resume immediately.",
     }
 
 

@@ -198,9 +198,17 @@ def _handle_workflows_slash(raw_args: str) -> str:
 
         if result is None:
             return f"⚠️ No pending action found with ID `{action_id}`."
+
+        # Trigger the workflow immediately — don't wait for next cron tick
+        try:
+            from .scheduler import trigger_workflow_now
+            trigger_workflow_now(result["workflow_id"])
+        except Exception:
+            pass  # Best-effort; the response is already recorded
+
         return (
             f"✅ Response submitted for `{action_id}`. "
-            f"The workflow will see it on the next scheduled run."
+            f"The workflow will resume immediately."
         )
 
     elif subcommand == "dismiss" and len(parts) > 1:
@@ -235,7 +243,111 @@ def _fmt_time(ts: Optional[float]) -> str:
 
 def _on_shutdown(**kwargs: Any) -> None:
     """Gracefully stop the scheduler when the plugin is unloaded."""
-    scheduler_shutdown(wait=False)
+    scheduler_shutdown()
+
+
+# ── pre_gateway_dispatch hook — capture chat replies for workflows ────────
+
+
+def _handle_pre_gateway_dispatch(
+    event: Any,
+    gateway: Any,
+    session_store: Any,
+    **kwargs: Any,
+) -> Optional[Dict[str, str]]:
+    """
+    Intercept incoming chat messages to capture workflow responses.
+
+    When a workflow has a pending action for the same platform+chat_id,
+    the user's reply is captured as the human response and the session
+    agent never sees it (return {"action": "skip"}).
+
+    If no matching pending action exists, returns None (normal dispatch).
+    """
+    try:
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+
+        platform = getattr(source, "platform", None)
+        if platform is None:
+            return None
+        platform_str = platform.value if hasattr(platform, "value") else str(platform)
+
+        chat_id = getattr(source, "chat_id", None)
+        if not chat_id:
+            return None
+
+        text = getattr(event, "text", "") or ""
+
+        db = get_db()
+        action = db.find_pending_by_origin(platform_str, str(chat_id))
+
+        if action is None:
+            return None  # No pending action for this chat — normal dispatch
+
+        # Capture the user's message as the response
+        resolved = db.resolve_pending_action(action["id"], text)
+
+        if resolved is None:
+            return None  # Action was already resolved/dismissed
+
+        logger.info(
+            "pre_gateway_dispatch: captured reply for action %s (workflow=%s, platform=%s, chat=%s)",
+            action["id"],
+            action["workflow_id"],
+            platform_str,
+            chat_id,
+        )
+
+        # Store gateway reference for future use (e.g. sending confirmations)
+        from .scheduler import set_gateway_ref
+        set_gateway_ref(gateway)
+
+        # Trigger the workflow immediately — don't wait for next cron tick
+        from .scheduler import trigger_workflow_now
+        trigger_workflow_now(action["workflow_id"])
+
+        # Send a confirmation back to the user via the gateway adapter
+        _send_confirmation(gateway, platform_str, str(chat_id), action["id"])
+
+        # Skip — the session agent should not process this message
+        return {"action": "skip", "reason": "workflow-response-captured"}
+
+    except Exception:
+        logger.exception("pre_gateway_dispatch hook failed")
+        return None
+
+
+def _send_confirmation(
+    gateway: Any,
+    platform_str: str,
+    chat_id: str,
+    action_id: str,
+) -> None:
+    """Try to send a confirmation message that the workflow response was captured."""
+    try:
+        adapters = getattr(gateway, "adapters", {}) or {}
+        # Platform enum values are lowercase; find matching adapter
+        for plat, adapter in adapters.items():
+            plat_str = plat.value if hasattr(plat, "value") else str(plat)
+            if plat_str.lower() == platform_str.lower():
+                # Schedule the send in the gateway's event loop
+                import asyncio
+                loop = getattr(gateway, "loop", None)
+                if loop and loop.is_running():
+                    async def _send():
+                        try:
+                            await adapter.send(
+                                chat_id,
+                                f"✅ Got it! Your response has been recorded for the workflow.",
+                            )
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_send(), loop)
+                break
+    except Exception:
+        pass  # Confirmation is best-effort; don't block on failure
 
 
 # ── Agent invocation callback ─────────────────────────────────────────────
@@ -382,6 +494,7 @@ def register(ctx: Any) -> None:
 
     # ── Register hooks ────────────────────────────────────────────────
     ctx.register_hook("pre_llm_call", _inject_workflow_context)
+    ctx.register_hook("pre_gateway_dispatch", _handle_pre_gateway_dispatch)
     ctx.register_hook("plugin_shutdown", _on_shutdown)
 
     # ── Register slash command ────────────────────────────────────────
@@ -415,6 +528,6 @@ def register(ctx: Any) -> None:
         logger.warning("Failed to start workflow scheduler", exc_info=True)
 
     logger.info(
-        "Workflow Engine v1.0.0 registered (%d tools, 2 hooks, 1 command, 1 skill)",
+        "Workflow Engine v1.0.0 registered (%d tools, 3 hooks, 1 command, 1 skill)",
         len(schema_map),
     )

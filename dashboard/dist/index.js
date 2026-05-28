@@ -36,7 +36,7 @@
 		return str.length > max ? str.slice(0, max) + "\u2026" : str
 	}
 
-	// ── Create/Edit Modal ───────────────────────────────────────────────
+	// ── Create / Edit Modal (cron-style backdrop blur) ──────────────────
 
 	function WorkflowFormModal(props) {
 		var onClose = props.onClose
@@ -69,7 +69,7 @@
 			setError = _error[1]
 
 		var isEdit = !!editWf
-		var titleText = isEdit ? "Edit Workflow" : "Create Workflow"
+		var titleText = isEdit ? "Edit Workflow" : "New Workflow"
 
 		var submit = useCallback(
 			function () {
@@ -144,48 +144,56 @@
 		return React.createElement(
 			"div",
 			{
-				className: "fixed inset-0 z-50 flex items-center justify-center",
-				style: { background: "rgba(0,0,0,0.55)" },
+				className: "fixed inset-0 z-[100] flex items-center justify-center p-4",
+				style: { background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" },
+				onClick: function (e) {
+					if (e.target === e.currentTarget) onClose()
+				},
 			},
 			React.createElement(
 				"div",
 				{
 					className: cn(
-						"bg-bg-primary rounded-lg border border-border shadow-xl w-full max-w-xl mx-4 p-6 max-h-[90vh] overflow-y-auto",
+						"relative w-full max-w-xl border border-border bg-card shadow-2xl flex flex-col",
 					),
 				},
 				React.createElement(
-					"div",
-					{ className: "flex items-start justify-between mb-4" },
-					React.createElement(
-						"h2",
-						{ className: "text-lg font-semibold" },
-						titleText,
-					),
-					React.createElement(
-						Button,
-						{ variant: "ghost", size: "icon", onClick: onClose },
-						"\u2715",
-					),
+					Button,
+					{
+						variant: "ghost",
+						size: "icon",
+						onClick: onClose,
+						className: "absolute right-2 top-2",
+					},
+					"\u2715",
 				),
-				error
-					? React.createElement(
-							"div",
-							{
-								className:
-									"mb-3 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400",
-							},
-							error,
-						)
-					: null,
 				React.createElement(
 					"div",
-					{ className: "space-y-3" },
+					{ className: "p-5 pb-3 border-b border-border" },
+					React.createElement(
+						"h2",
+						{ className: "text-base font-semibold tracking-wide" },
+						titleText,
+					),
+				),
+				React.createElement(
+					"div",
+					{ className: "p-5 grid gap-4" },
+					error
+						? React.createElement(
+								"div",
+								{
+									className:
+										"rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400",
+								},
+								error,
+							)
+						: null,
 					isEdit
 						? null
 						: React.createElement(
 								"div",
-								null,
+								{ className: "grid gap-2" },
 								React.createElement(
 									Label,
 									null,
@@ -206,7 +214,7 @@
 							),
 					React.createElement(
 						"div",
-						null,
+						{ className: "grid gap-2" },
 						React.createElement(
 							Label,
 							null,
@@ -223,7 +231,7 @@
 					),
 					React.createElement(
 						"div",
-						null,
+						{ className: "grid gap-2" },
 						React.createElement(Label, null, "Description"),
 						React.createElement(Input, {
 							value: description,
@@ -235,34 +243,71 @@
 					),
 					React.createElement(
 						"div",
-						null,
+						{ className: "grid grid-cols-2 gap-4" },
 						React.createElement(
-							Label,
-							null,
-							"Cron Expression",
-							React.createElement("span", { className: "text-red-400" }, " *"),
+							"div",
+							{ className: "grid gap-2" },
+							React.createElement(
+								Label,
+								null,
+								"Schedule",
+								React.createElement(
+									"span",
+									{ className: "text-red-400" },
+									" *",
+								),
+							),
+							React.createElement(Input, {
+								value: cron,
+								onChange: function (e) {
+									setCron(e.target.value)
+								},
+								placeholder: "0 9 * * 1-5",
+							}),
 						),
-						React.createElement(Input, {
-							value: cron,
-							onChange: function (e) {
-								setCron(e.target.value)
-							},
-							placeholder: "e.g. 0 9 * * 1-5 (weekdays at 9am)",
-						}),
+						isEdit
+							? React.createElement(
+									"div",
+									{ className: "grid gap-2" },
+									React.createElement(Label, null, "Status"),
+									React.createElement(
+										"div",
+										{ className: "flex items-center gap-2 pt-2" },
+										React.createElement("input", {
+											type: "checkbox",
+											id: "wf-enabled-modal",
+											checked: enabled,
+											onChange: function (e) {
+												setEnabled(e.target.checked)
+											},
+											className: "rounded",
+										}),
+										React.createElement(
+											Label,
+											{ htmlFor: "wf-enabled-modal" },
+											"Enabled",
+										),
+									),
+								)
+							: React.createElement("div", null),
 					),
 					React.createElement(
 						"div",
-						null,
+						{ className: "grid gap-2" },
 						React.createElement(
 							Label,
 							null,
 							"System Prompt",
-							React.createElement("span", { className: "text-red-400" }, " *"),
+							React.createElement(
+								"span",
+								{ className: "text-red-400" },
+								" *",
+							),
 						),
 						React.createElement("textarea", {
 							rows: 6,
 							className:
-								"w-full rounded border border-border bg-bg-secondary px-3 py-2 text-sm font-mono",
+								"flex min-h-[80px] w-full border border-border bg-background/40 px-3 py-2 text-sm font-mono shadow-sm",
 							value: prompt,
 							onChange: function (e) {
 								setPrompt(e.target.value)
@@ -270,30 +315,12 @@
 							placeholder: "Instructions for the agent on each run...",
 						}),
 					),
-					isEdit
-						? React.createElement(
-								"div",
-								{ className: "flex items-center gap-2" },
-								React.createElement("input", {
-									type: "checkbox",
-									id: "wf-enabled",
-									checked: enabled,
-									onChange: function (e) {
-										setEnabled(e.target.checked)
-									},
-									className: "rounded",
-								}),
-								React.createElement(
-									Label,
-									{ htmlFor: "wf-enabled" },
-									"Enabled",
-								),
-							)
-						: null,
 				),
 				React.createElement(
 					"div",
-					{ className: "flex gap-2 justify-end mt-4" },
+					{
+						className: "flex gap-2 justify-end px-5 pb-5",
+					},
 					React.createElement(
 						Button,
 						{ variant: "outline", onClick: onClose },
@@ -309,7 +336,7 @@
 		)
 	}
 
-	// ── Workflow Card ────────────────────────────────────────────────────
+	// ── Workflow Card (cron-style horizontal) ───────────────────────────
 
 	function WorkflowCard(props) {
 		var wf = props.wf
@@ -322,17 +349,10 @@
 				e.stopPropagation()
 				fetchJSON(
 					"/api/plugins/workflow/workflows/" + encodeURIComponent(wf.id),
-					{
-						method: "PUT",
-						body: JSON.stringify({ enabled: !wf.enabled }),
-					},
+					{ method: "PUT", body: JSON.stringify({ enabled: !wf.enabled }) },
 				)
-					.then(function () {
-						onRefresh()
-					})
-					.catch(function (err) {
-						console.error(err)
-					})
+					.then(function () { onRefresh() })
+					.catch(function (err) { console.error(err) })
 			},
 			[wf.id, wf.enabled, onRefresh],
 		)
@@ -340,24 +360,13 @@
 		var del = useCallback(
 			function (e) {
 				e.stopPropagation()
-				if (
-					!confirm(
-						"Delete workflow '" +
-							wf.name +
-							"' and all its state? This cannot be undone.",
-					)
-				)
-					return
+				if (!confirm("Delete workflow '" + wf.name + "' and all its state? This cannot be undone.")) return
 				fetchJSON(
 					"/api/plugins/workflow/workflows/" + encodeURIComponent(wf.id),
 					{ method: "DELETE" },
 				)
-					.then(function () {
-						onRefresh()
-					})
-					.catch(function (err) {
-						console.error(err)
-					})
+					.then(function () { onRefresh() })
+					.catch(function (err) { console.error(err) })
 			},
 			[wf.id, wf.name, onRefresh],
 		)
@@ -366,137 +375,82 @@
 			function (e) {
 				e.stopPropagation()
 				fetchJSON(
-					"/api/plugins/workflow/workflows/" +
-						encodeURIComponent(wf.id) +
-						"/run",
+					"/api/plugins/workflow/workflows/" + encodeURIComponent(wf.id) + "/run",
 					{ method: "POST" },
 				)
-					.then(function (res) {
-						if (res.success) {
-							alert(
-								"Run triggered. Status: " +
-									((res.run && res.run.status) || "unknown"),
-							)
-						} else {
-							alert("Could not run: " + (res.message || res.error || "unknown"))
-						}
-						onRefresh()
-					})
-					.catch(function (err) {
-						console.error(err)
-					})
+					.then(function () { onRefresh() })
+					.catch(function (err) { console.error(err) })
 			},
 			[wf.id, onRefresh],
 		)
 
+		var isActive = wf.enabled
+		var stateLabel = isActive ? "Active" : "Paused"
+
 		return React.createElement(
-			"div",
+			Card,
 			{
-				className:
-					"rounded-lg border border-border bg-bg-secondary p-4 cursor-pointer hover:border-primary/40 transition-colors",
-				onClick: function () {
-					onSelect(wf.id)
-				},
+				className: "cursor-pointer hover:border-primary/30 transition-colors",
+				onClick: function () { onSelect(wf.id) },
 			},
 			React.createElement(
-				"div",
-				{ className: "flex items-start justify-between mb-2" },
+				CardContent,
+				{ className: "flex items-start gap-4 py-4" },
 				React.createElement(
 					"div",
-					{ className: "flex items-center gap-2" },
-					React.createElement(
-						Badge,
-						{ variant: wf.enabled ? "default" : "secondary" },
-						wf.enabled ? "\u25CF Active" : "\u25CB Paused",
-					),
+					{ className: "flex-1 min-w-0" },
 					React.createElement(
 						"div",
-						null,
-						React.createElement(
-							"h3",
-							{ className: "text-sm font-semibold" },
-							wf.name,
-						),
-						React.createElement(
-							"span",
-							{ className: "text-xs text-text-tertiary font-mono" },
-							wf.id,
-						),
+						{ className: "flex items-center gap-2 mb-1" },
+						React.createElement("span", { className: "font-medium text-sm truncate" }, wf.name),
+						React.createElement(Badge, { tone: isActive ? "success" : "warning" },
+							(isActive ? "\u25CF" : "\u25CB") + " " + stateLabel),
+					),
+					wf.description
+						? React.createElement("p", { className: "text-xs text-text-tertiary truncate mb-1" },
+							truncate(wf.description, 100))
+						: null,
+					React.createElement(
+						"div",
+						{ className: "flex items-center gap-4 text-xs text-text-tertiary" },
+						React.createElement("span", { className: "font-mono" }, wf.cron_expression),
+						wf.next_run
+							? React.createElement("span", null, "Next: ", fmtTime(new Date(wf.next_run).getTime() / 1000))
+							: null,
 					),
 				),
 				React.createElement(
 					"div",
 					{
-						className: "flex gap-1",
-						onClick: function (e) {
-							e.stopPropagation()
-						},
+						className: "flex items-center gap-1 shrink-0",
+						onClick: function (e) { e.stopPropagation() },
 					},
-					React.createElement(
-						Button,
-						{
-							variant: "ghost",
-							size: "icon",
-							onClick: runNow,
-							title: "Run now",
-						},
-						"\u25B6",
-					),
-					React.createElement(
-						Button,
-						{
-							variant: "ghost",
-							size: "icon",
-							onClick: function () {
-								onEdit(wf)
-							},
-							title: "Edit",
-						},
-						"\u270E",
-					),
-					React.createElement(
-						Button,
-						{ variant: "ghost", size: "icon", onClick: del, title: "Delete" },
-						"\u2715",
-					),
+					React.createElement(Button, {
+						variant: "ghost", size: "icon",
+						title: isActive ? "Pause" : "Resume",
+						onClick: toggleEnabled,
+					}, isActive ? "\u23F8" : "\u25B6"),
+					React.createElement(Button, {
+						variant: "ghost", size: "icon",
+						title: "Run now",
+						onClick: runNow,
+					}, "\u26A1"),
+					React.createElement(Button, {
+						variant: "ghost", size: "icon",
+						title: "Edit",
+						onClick: function () { onEdit(wf) },
+					}, "\u270E"),
+					React.createElement(Button, {
+						variant: "ghost", size: "icon",
+						title: "Delete",
+						onClick: del,
+					}, "\u2715"),
 				),
 			),
-			React.createElement(
-				"div",
-				{
-					className:
-						"flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-tertiary mt-1",
-				},
-				React.createElement(
-					"span",
-					null,
-					"Schedule: ",
-					React.createElement(
-						"code",
-						{ className: "text-text-secondary" },
-						wf.cron_expression,
-					),
-				),
-				wf.next_run
-					? React.createElement(
-							"span",
-							null,
-							"Next: ",
-							fmtTime(new Date(wf.next_run).getTime() / 1000),
-						)
-					: null,
-			),
-			wf.description
-				? React.createElement(
-						"p",
-						{ className: "text-xs text-text-tertiary mt-2 line-clamp-2" },
-						wf.description,
-					)
-				: null,
 		)
 	}
 
-	// ── Pending Action Row ───────────────────────────────────────────────
+	// ── Pending Action Card (amber-tinted, matches cron card style) ─────
 
 	function PendingRow(props) {
 		var action = props.action
@@ -514,24 +468,12 @@
 				if (!response.trim()) return
 				setSubmitting(true)
 				fetchJSON(
-					"/api/plugins/workflow/pending/" +
-						encodeURIComponent(action.id) +
-						"/respond",
-					{
-						method: "POST",
-						body: JSON.stringify({ response: response.trim() }),
-					},
+					"/api/plugins/workflow/pending/" + encodeURIComponent(action.id) + "/respond",
+					{ method: "POST", body: JSON.stringify({ response: response.trim() }) },
 				)
-					.then(function () {
-						setResponse("")
-						onRefresh()
-					})
-					.catch(function (e) {
-						console.error(e)
-					})
-					.finally(function () {
-						setSubmitting(false)
-					})
+					.then(function () { setResponse(""); onRefresh() })
+					.catch(function (e) { console.error(e) })
+					.finally(function () { setSubmitting(false) })
 			},
 			[action.id, response, onRefresh],
 		)
@@ -539,75 +481,58 @@
 		var dismiss = useCallback(
 			function () {
 				fetchJSON(
-					"/api/plugins/workflow/pending/" +
-						encodeURIComponent(action.id) +
-						"/dismiss",
+					"/api/plugins/workflow/pending/" + encodeURIComponent(action.id) + "/dismiss",
 					{ method: "POST" },
 				)
-					.then(function () {
-						onRefresh()
-					})
-					.catch(function (e) {
-						console.error(e)
-					})
+					.then(function () { onRefresh() })
+					.catch(function (e) { console.error(e) })
 			},
 			[action.id, onRefresh],
 		)
 
 		return React.createElement(
-			"div",
-			{
-				className: "rounded border border-amber-500/30 bg-amber-500/5 p-3 mb-2",
-			},
+			Card,
+			{ className: "border-amber-500/30 bg-amber-500/[0.03]" },
 			React.createElement(
-				"div",
-				{ className: "mb-2" },
+				CardContent,
+				{ className: "flex items-start gap-4 py-3" },
 				React.createElement(
-					"p",
-					{ className: "text-sm font-medium" },
-					action.question,
-				),
-				action.context
-					? React.createElement(
-							"pre",
-							{
-								className:
-									"mt-1 text-xs text-text-tertiary whitespace-pre-wrap break-words max-h-24 overflow-y-auto bg-bg-tertiary rounded p-2",
-							},
-							truncate(action.context, 500),
-						)
-					: null,
-				React.createElement(
-					"span",
-					{ className: "text-xs text-text-tertiary mt-1 block" },
-					"From: ",
-					React.createElement("code", null, action.workflow_id),
-					" \u2022 ",
-					fmtTime(action.created_at),
-				),
-			),
-			React.createElement(
-				"div",
-				{ className: "flex gap-2 items-end" },
-				React.createElement(Input, {
-					placeholder: "Type your response...",
-					value: response,
-					onChange: function (e) {
-						setResponse(e.target.value)
-					},
-					onKeyDown: function (e) {
-						if (e.key === "Enter" && response.trim()) respond()
-					},
-				}),
-				React.createElement(
-					Button,
-					{ onClick: respond, disabled: submitting || !response.trim() },
-					submitting ? "Sending\u2026" : "Respond",
+					"div",
+					{ className: "flex-1 min-w-0" },
+					React.createElement(
+						"div",
+						{ className: "flex items-center gap-2 mb-1" },
+						React.createElement("span", { className: "font-medium text-sm truncate" }, action.question),
+						React.createElement(Badge, { tone: "warning" }, "\u23F3 Awaiting input"),
+					),
+					action.context
+						? React.createElement("pre", {
+								className: "text-xs text-text-tertiary whitespace-pre-wrap break-words max-h-16 overflow-y-auto bg-bg-tertiary rounded p-2 mb-1",
+							}, truncate(action.context, 300))
+						: null,
+					React.createElement(
+						"div",
+						{ className: "flex items-center gap-4 text-xs text-text-tertiary" },
+						React.createElement("span", { className: "font-mono" }, action.workflow_id),
+						React.createElement("span", null, fmtTime(action.created_at)),
+					),
 				),
 				React.createElement(
-					Button,
-					{ variant: "ghost", onClick: dismiss },
-					"Dismiss",
+					"div",
+					{ className: "flex items-center gap-1 shrink-0" },
+					React.createElement(Input, {
+						placeholder: "Type your response...",
+						value: response,
+						onChange: function (e) { setResponse(e.target.value) },
+						onKeyDown: function (e) { if (e.key === "Enter" && response.trim()) respond() },
+						style: { width: "180px", fontSize: "0.8125rem" },
+					}),
+					React.createElement(Button, {
+						size: "sm", onClick: respond, disabled: submitting || !response.trim(),
+					}, submitting ? "Sending\u2026" : "Respond"),
+					React.createElement(Button, {
+						variant: "ghost", size: "icon", onClick: dismiss, title: "Dismiss",
+					}, "\u2715"),
 				),
 			),
 		)
@@ -632,375 +557,109 @@
 
 		var load = useCallback(
 			function () {
-				setLoading(true)
-				setError("")
-				fetchJSON(
-					"/api/plugins/workflow/workflows/" + encodeURIComponent(workflowId),
-				)
+				setLoading(true); setError("")
+				fetchJSON("/api/plugins/workflow/workflows/" + encodeURIComponent(workflowId))
 					.then(function (d) {
-						if (d.error) {
-							setError(d.error)
-							setData(null)
-						} else {
-							setData(d)
-						}
+						if (d.error) { setError(d.error); setData(null) }
+						else { setData(d) }
 					})
-					.catch(function (e) {
-						setError(e.message)
-					})
-					.finally(function () {
-						setLoading(false)
-					})
+					.catch(function (e) { setError(e.message) })
+					.finally(function () { setLoading(false) })
 			},
 			[workflowId],
 		)
 
-		useEffect(
-			function () {
-				load()
-			},
-			[load],
-		)
+		useEffect(function () { load() }, [load])
 
-		if (loading)
-			return React.createElement(
-				"div",
-				{ className: "p-8 text-center text-text-tertiary" },
-				"Loading\u2026",
-			)
+		if (loading) return React.createElement("div", { className: "flex items-center justify-center py-24" },
+			React.createElement("span", { className: "text-text-tertiary text-sm" }, "Loading\u2026"))
 
-		if (error)
-			return React.createElement(
-				"div",
-				{ className: "p-4" },
-				React.createElement("div", { className: "text-red-400 mb-2" }, error),
-				React.createElement(
-					Button,
-					{ variant: "outline", onClick: onBack },
-					"\u2190 Back",
-				),
-			)
+		if (error) return React.createElement("div", { className: "p-4" },
+			React.createElement("div", { className: "text-red-400 mb-2" }, error),
+			React.createElement(Button, { variant: "outline", onClick: onBack }, "\u2190 Back"))
 
-		if (!data || !data.found)
-			return React.createElement(
-				"div",
-				{ className: "p-4" },
-				React.createElement(
-					"p",
-					{ className: "text-text-tertiary mb-2" },
-					"Workflow not found.",
-				),
-				React.createElement(
-					Button,
-					{ variant: "outline", onClick: onBack },
-					"\u2190 Back",
-				),
-			)
+		if (!data || !data.found) return React.createElement("div", { className: "p-4" },
+			React.createElement("p", { className: "text-text-tertiary mb-2" }, "Workflow not found."),
+			React.createElement(Button, { variant: "outline", onClick: onBack }, "\u2190 Back"))
 
 		var wf = data.workflow
 		var stateKeys = data.state_keys || []
 		var stateData = data.state || {}
 		var pendingActions = data.pending_actions || []
 		var resolvedActions = data.resolved_actions || []
+		var isActive = wf.enabled
 
-		return React.createElement(
-			"div",
-			{ className: "p-4" },
-			React.createElement(
-				"div",
-				{ className: "flex items-center gap-3 mb-4" },
-				React.createElement(
-					Button,
-					{ variant: "outline", onClick: onBack },
-					"\u2190 Back",
-				),
-				React.createElement(
-					"div",
-					null,
-					React.createElement(
-						"h2",
-						{ className: "text-lg font-semibold" },
-						wf.name,
-					),
-					React.createElement(
-						"span",
-						{ className: "text-xs text-text-tertiary font-mono" },
-						wf.id,
-					),
-				),
-			),
+		return React.createElement("div", { className: "flex flex-col gap-4 p-4" },
+			// Header
+			React.createElement("div", { className: "flex items-center gap-3" },
+				React.createElement(Button, { variant: "outline", size: "sm", onClick: onBack }, "\u2190 Back"),
+				React.createElement("div", { className: "flex items-center gap-2" },
+					React.createElement("h2", { className: "text-base font-semibold" }, wf.name),
+					React.createElement(Badge, { tone: isActive ? "success" : "warning" },
+						(isActive ? "\u25CF" : "\u25CB") + " " + (isActive ? "Active" : "Paused")))),
 
-			// Meta Card
-			React.createElement(
-				Card,
-				{ className: "mb-4" },
-				React.createElement(
-					CardContent,
-					{ className: "pt-4" },
-					React.createElement(
-						"div",
-						{ className: "grid grid-cols-2 gap-3 text-sm" },
-						React.createElement(
-							"div",
-							null,
-							React.createElement(
-								"span",
-								{ className: "text-text-tertiary" },
-								"Schedule",
-							),
-							React.createElement(
-								"p",
-								{ className: "font-mono" },
-								wf.cron_expression,
-							),
-						),
-						React.createElement(
-							"div",
-							null,
-							React.createElement(
-								"span",
-								{ className: "text-text-tertiary" },
-								"Next Run",
-							),
-							React.createElement(
-								"p",
-								null,
-								wf.next_run
-									? fmtTime(new Date(wf.next_run).getTime() / 1000)
-									: "\u2014",
-							),
-						),
-						React.createElement(
-							"div",
-							null,
-							React.createElement(
-								"span",
-								{ className: "text-text-tertiary" },
-								"Status",
-							),
-							React.createElement(
-								"p",
-								null,
-								React.createElement(
-									Badge,
-									{ variant: wf.enabled ? "default" : "secondary" },
-									wf.enabled ? "Enabled" : "Disabled",
-								),
-							),
-						),
-						React.createElement(
-							"div",
-							null,
-							React.createElement(
-								"span",
-								{ className: "text-text-tertiary" },
-								"State Keys",
-							),
-							React.createElement("p", null, stateKeys.length),
-						),
-					),
-					wf.description
-						? React.createElement(
-								"p",
-								{
-									className:
-										"text-sm text-text-tertiary mt-3 border-t border-border pt-3",
-								},
-								wf.description,
-							)
-						: null,
-				),
-			),
+			// Meta
+			React.createElement(Card, null,
+				React.createElement(CardContent, { className: "py-3" },
+					React.createElement("div", { className: "flex items-center gap-4 text-xs text-text-tertiary" },
+						React.createElement("span", { className: "font-mono" }, wf.cron_expression),
+						React.createElement("span", null, "Next: ", wf.next_run ? fmtTime(new Date(wf.next_run).getTime() / 1000) : "\u2014"),
+						React.createElement("span", null, "State keys: ", stateKeys.length)),
+					wf.description ? React.createElement("p", { className: "text-xs text-text-tertiary mt-2 border-t border-border pt-2" }, wf.description) : null)),
 
 			// Prompt
-			React.createElement(
-				Card,
-				{ className: "mb-4" },
-				React.createElement(
-					CardHeader,
-					null,
-					React.createElement(
-						CardTitle,
-						{ className: "text-sm" },
-						"System Prompt",
-					),
-				),
-				React.createElement(
-					CardContent,
-					null,
-					React.createElement(
-						"pre",
-						{
-							className:
-								"text-xs bg-bg-tertiary rounded p-3 max-h-48 overflow-y-auto whitespace-pre-wrap break-words",
-						},
-						wf.prompt,
-					),
-				),
-			),
+			React.createElement(Card, null,
+				React.createElement(CardHeader, null, React.createElement(CardTitle, { className: "text-sm" }, "System Prompt")),
+				React.createElement(CardContent, null,
+					React.createElement("pre", { className: "text-xs bg-bg-tertiary rounded p-3 max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono" }, wf.prompt))),
 
 			// State
-			React.createElement(
-				Card,
-				{ className: "mb-4" },
-				React.createElement(
-					CardHeader,
-					null,
-					React.createElement(
-						CardTitle,
-						{ className: "text-sm" },
-						"State (" + stateKeys.length + " keys)",
-					),
-				),
-				React.createElement(
-					CardContent,
-					null,
+			React.createElement(Card, null,
+				React.createElement(CardHeader, null, React.createElement(CardTitle, { className: "text-sm" }, "State (" + stateKeys.length + " keys)")),
+				React.createElement(CardContent, null,
 					stateKeys.length > 0
-						? React.createElement(
-								"div",
-								{ className: "space-y-1" },
-								stateKeys.map(function (key) {
-									var val = stateData[key]
-									var preview =
-										typeof val === "string" ? val : JSON.stringify(val)
-									return React.createElement(
-										"details",
-										{
-											key: key,
-											className: "rounded border border-border bg-bg-secondary",
-										},
-										React.createElement(
-											"summary",
-											{
-												className:
-													"px-3 py-2 text-sm font-mono cursor-pointer hover:bg-bg-tertiary",
-											},
-											key,
-										),
-										React.createElement(
-											"pre",
-											{
-												className:
-													"px-3 py-2 text-xs text-text-tertiary border-t border-border whitespace-pre-wrap break-words max-h-32 overflow-y-auto",
-											},
-											truncate(preview, 1000),
-										),
-									)
-								}),
-							)
-						: React.createElement(
-								"p",
-								{ className: "text-xs text-text-tertiary" },
-								"No state saved yet.",
-							),
-				),
-			),
+						? React.createElement("div", { className: "space-y-1" },
+							stateKeys.map(function (key) {
+								var val = stateData[key]
+								var preview = typeof val === "string" ? val : JSON.stringify(val)
+								return React.createElement("details", { key: key, className: "rounded border border-border bg-bg-secondary" },
+									React.createElement("summary", { className: "px-3 py-2 text-sm font-mono cursor-pointer hover:bg-bg-tertiary" }, key),
+									React.createElement("pre", { className: "px-3 py-2 text-xs text-text-tertiary border-t border-border whitespace-pre-wrap break-words max-h-32 overflow-y-auto" }, truncate(preview, 1000)))
+							}))
+						: React.createElement("p", { className: "text-xs text-text-tertiary" }, "No state saved yet."))),
 
-			// Pending actions
-			pendingActions.length > 0
-				? React.createElement(
-						Card,
-						{ className: "mb-4" },
-						React.createElement(
-							CardHeader,
-							null,
-							React.createElement(
-								CardTitle,
-								{ className: "text-sm" },
-								"Pending Input (" + pendingActions.length + ")",
-							),
-						),
-						React.createElement(
-							CardContent,
-							null,
-							pendingActions.map(function (a) {
-								return React.createElement(PendingRow, {
-									key: a.id,
-									action: a,
-									onRefresh: load,
-								})
-							}),
-						),
-					)
-				: null,
+			// Pending
+			pendingActions.length > 0 ? React.createElement(Card, null,
+				React.createElement(CardHeader, null, React.createElement(CardTitle, { className: "text-sm" }, "Pending Input (" + pendingActions.length + ")")),
+				React.createElement(CardContent, null,
+					pendingActions.map(function (a) { return React.createElement(PendingRow, { key: a.id, action: a, onRefresh: load }) }))) : null,
 
-			// Resolved actions
-			resolvedActions.length > 0
-				? React.createElement(
-						Card,
-						{ className: "mb-4" },
-						React.createElement(
-							CardHeader,
-							null,
-							React.createElement(
-								CardTitle,
-								{ className: "text-sm" },
-								"Recently Resolved (" + resolvedActions.length + ")",
-							),
-						),
-						React.createElement(
-							CardContent,
-							null,
-							React.createElement(
-								"div",
-								{ className: "space-y-1" },
-								resolvedActions.slice(0, 5).map(function (a) {
-									return React.createElement(
-										"div",
-										{
-											key: a.id,
-											className:
-												"rounded border border-border bg-bg-secondary p-2 text-xs",
-										},
-										React.createElement(
-											"p",
-											{ className: "text-text-secondary" },
-											"Q: ",
-											a.question,
-										),
-										React.createElement(
-											"p",
-											{ className: "text-green-400 mt-1" },
-											"A: ",
-											a.response,
-										),
-									)
-								}),
-							),
-						),
-					)
-				: null,
+			// Resolved
+			resolvedActions.length > 0 ? React.createElement(Card, null,
+				React.createElement(CardHeader, null, React.createElement(CardTitle, { className: "text-sm" }, "Recently Resolved (" + resolvedActions.length + ")")),
+				React.createElement(CardContent, null,
+					React.createElement("div", { className: "space-y-1" },
+						resolvedActions.slice(0, 10).map(function (a) {
+							return React.createElement("div", { key: a.id, className: "rounded border border-border bg-bg-secondary p-2 text-xs" },
+								React.createElement("p", { className: "text-text-secondary" }, "Q: ", a.question),
+								React.createElement("p", { className: "text-green-400 mt-1" }, "A: ", a.response))
+						})))) : null,
 		)
 	}
 
 	// ── Main App ─────────────────────────────────────────────────────────
 
 	function App() {
-		var _workflows = useState([]),
-			workflows = _workflows[0],
-			setWorkflows = _workflows[1]
-		var _loading = useState(true),
-			loading = _loading[0],
-			setLoading = _loading[1]
-		var _error = useState(""),
-			error = _error[0],
-			setError = _error[1]
-		var _showForm = useState(false),
-			showForm = _showForm[0],
-			setShowForm = _showForm[1]
-		var _editWf = useState(null),
-			editWf = _editWf[0],
-			setEditWf = _editWf[1]
-		var _selectedWf = useState(null),
-			selectedWf = _selectedWf[0],
-			setSelectedWf = _selectedWf[1]
-		var _pending = useState([]),
-			pending = _pending[0],
-			setPending = _pending[1]
+		var _workflows = useState([]), workflows = _workflows[0], setWorkflows = _workflows[1]
+		var _loading = useState(true), loading = _loading[0], setLoading = _loading[1]
+		var _error = useState(""), error = _error[0], setError = _error[1]
+		var _showForm = useState(false), showForm = _showForm[0], setShowForm = _showForm[1]
+		var _editWf = useState(null), editWf = _editWf[0], setEditWf = _editWf[1]
+		var _selectedWf = useState(null), selectedWf = _selectedWf[0], setSelectedWf = _selectedWf[1]
+		var _pending = useState([]), pending = _pending[0], setPending = _pending[1]
 
 		var load = useCallback(function () {
-			setLoading(true)
-			setError("")
+			setLoading(true); setError("")
 			Promise.all([
 				fetchJSON("/api/plugins/workflow/workflows"),
 				fetchJSON("/api/plugins/workflow/pending"),
@@ -1009,139 +668,51 @@
 					setWorkflows(results[0].workflows || [])
 					setPending(results[1].pending || [])
 				})
-				.catch(function (e) {
-					setError("Failed to load: " + e.message)
-				})
-				.finally(function () {
-					setLoading(false)
-				})
+				.catch(function (e) { setError("Failed to load: " + e.message) })
+				.finally(function () { setLoading(false) })
 		}, [])
 
-		useEffect(
-			function () {
-				load()
-			},
-			[load],
-		)
+		useEffect(function () { load() }, [load])
 
-		var handleEdit = useCallback(function (wf) {
-			setEditWf(wf)
-			setShowForm(true)
-		}, [])
-		var handleCloseForm = useCallback(function () {
-			setShowForm(false)
-			setEditWf(null)
-		}, [])
+		var handleEdit = useCallback(function (wf) { setEditWf(wf); setShowForm(true) }, [])
+		var handleCloseForm = useCallback(function () { setShowForm(false); setEditWf(null) }, [])
 
 		if (selectedWf) {
 			return React.createElement(WorkflowDetail, {
 				workflowId: selectedWf,
-				onBack: function () {
-					setSelectedWf(null)
-					load()
-				},
+				onBack: function () { setSelectedWf(null); load() },
 				onRefresh: load,
 			})
 		}
 
-		return React.createElement(
-			"div",
-			{ className: "p-4" },
-			React.createElement(
-				"div",
-				{ className: "flex items-center justify-between mb-4" },
-				React.createElement(
-					"h2",
-					{ className: "text-lg font-semibold" },
-					"Workflows",
-				),
-				React.createElement(
-					Button,
-					{
-						onClick: function () {
-							setEditWf(null)
-							setShowForm(true)
-						},
-					},
-					"+ New Workflow",
-				),
-			),
+		return React.createElement("div", { className: "flex flex-col gap-6 p-4" },
+			error ? React.createElement("div", { className: "rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400" }, error) : null,
 
-			error
-				? React.createElement(
-						"div",
-						{
-							className:
-								"mb-4 rounded border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400",
-						},
-						error,
-					)
-				: null,
+			// Pending section
+			pending.length > 0 ? React.createElement("div", { className: "flex flex-col gap-3" },
+				React.createElement("div", { className: "flex items-center gap-2 text-sm text-text-tertiary" }, "\u23F3 Pending Input (" + pending.length + ")"),
+				pending.map(function (a) { return React.createElement(PendingRow, { key: a.id, action: a, onRefresh: load }) })) : null,
 
-			pending.length > 0
-				? React.createElement(
-						Card,
-						{ className: "mb-4" },
-						React.createElement(
-							CardHeader,
-							null,
-							React.createElement(
-								CardTitle,
-								{ className: "text-sm flex items-center gap-2" },
-								"\u23F3 Pending Input (" + pending.length + ")",
-							),
-						),
-						React.createElement(
-							CardContent,
-							null,
-							pending.map(function (a) {
-								return React.createElement(PendingRow, {
-									key: a.id,
-									action: a,
-									onRefresh: load,
-								})
-							}),
-						),
-					)
-				: null,
+			// Header
+			React.createElement("div", { className: "flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" },
+				React.createElement("div", { className: "flex items-center gap-2 text-sm text-text-tertiary" }, "\u23F0 Scheduled Workflows (" + workflows.length + ")"),
+				React.createElement(Button, { size: "sm", className: "self-start", onClick: function () { setEditWf(null); setShowForm(true) } }, "+ New Workflow")),
 
-			loading
-				? React.createElement(
-						"div",
-						{ className: "text-center text-text-tertiary py-8" },
-						"Loading workflows\u2026",
-					)
-				: workflows.length === 0
-					? React.createElement(
-							"div",
-							{ className: "text-center text-text-tertiary py-8" },
-							"No workflows yet. Click '+ New Workflow' to create your first scheduled workflow.",
-						)
-					: React.createElement(
-							"div",
-							{ className: "grid gap-3" },
-							workflows.map(function (wf) {
-								return React.createElement(WorkflowCard, {
-									key: wf.id,
-									wf: wf,
-									onRefresh: load,
-									onEdit: handleEdit,
-									onSelect: setSelectedWf,
-								})
-							}),
-						),
+			// Loading
+			loading ? React.createElement(Card, null, React.createElement(CardContent, { className: "py-8 text-center text-sm text-text-tertiary" }, "Loading workflows\u2026")) : null,
 
-			showForm
-				? React.createElement(WorkflowFormModal, {
-						onClose: handleCloseForm,
-						onRefresh: load,
-						editWorkflow: editWf,
-					})
-				: null,
+			// Empty
+			!loading && workflows.length === 0 ? React.createElement(Card, null, React.createElement(CardContent, { className: "py-8 text-center text-sm text-text-tertiary" }, "No workflows yet. Click '+ New Workflow' above to create your first scheduled workflow.")) : null,
+
+			// Cards
+			workflows.length > 0 ? React.createElement("div", { className: "flex flex-col gap-3" },
+				workflows.map(function (wf) {
+					return React.createElement(WorkflowCard, { key: wf.id, wf: wf, onRefresh: load, onEdit: handleEdit, onSelect: setSelectedWf })
+				})) : null,
+
+			showForm ? React.createElement(WorkflowFormModal, { onClose: handleCloseForm, onRefresh: load, editWorkflow: editWf }) : null,
 		)
 	}
-
-	// ── Register ──────────────────────────────────────────────────────────
 
 	window.__HERMES_PLUGINS__.register("workflow", App)
 })()

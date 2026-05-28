@@ -316,9 +316,16 @@ class WorkflowDB:
         question: str,
         run_id: Optional[str] = None,
         context: Optional[str] = None,
+        max_wait_seconds: Optional[int] = None,
+        origin_platform: Optional[str] = None,
+        origin_chat_id: Optional[str] = None,
+        origin_thread_id: Optional[str] = None,
+        origin_user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a human-in-the-loop question for a workflow."""
         now = time.time()
+        expires_at = (now + max_wait_seconds) if max_wait_seconds else None
+
         action = {
             "id": str(uuid.uuid4()),
             "workflow_id": workflow_id,
@@ -329,6 +336,12 @@ class WorkflowDB:
             "response": None,
             "created_at": now,
             "responded_at": None,
+            "expires_at": expires_at,
+            "timeout_status": None,
+            "origin_platform": origin_platform,
+            "origin_chat_id": origin_chat_id,
+            "origin_thread_id": origin_thread_id,
+            "origin_user_id": origin_user_id,
         }
 
         with self._lock:
@@ -417,6 +430,56 @@ class WorkflowDB:
             and (a.get("responded_at") or 0) > since
         ]
         return sorted(result, key=lambda a: a.get("responded_at", 0))
+
+    def get_expired_actions(self) -> List[Dict[str, Any]]:
+        """Get all pending actions that have passed their expires_at timestamp."""
+        now = time.time()
+        with self._lock:
+            pending = _read_json(self._pending_path) or []
+        return [
+            a for a in pending
+            if a.get("status") == "pending"
+            and a.get("expires_at") is not None
+            and a["expires_at"] < now
+        ]
+
+    def expire_action(self, action_id: str) -> Optional[Dict[str, Any]]:
+        """Mark a pending action as expired due to timeout."""
+        now = time.time()
+        with self._lock:
+            pending = _read_json(self._pending_path) or []
+            for a in pending:
+                if a["id"] == action_id and a.get("status") == "pending":
+                    a["status"] = "dismissed"
+                    a["timeout_status"] = "expired"
+                    a["responded_at"] = now
+                    _write_json(self._pending_path, pending)
+                    logger.info("Pending action expired: id=%s", action_id)
+                    return a
+        return None
+
+    def find_pending_by_origin(
+        self,
+        platform: str,
+        chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Find the first pending action for a given platform + chat_id.
+
+        Used by the pre_gateway_dispatch hook to route incoming chat messages
+        to the correct pending workflow action.
+
+        Returns the action dict if found, None otherwise.
+        """
+        with self._lock:
+            pending = _read_json(self._pending_path) or []
+        for a in pending:
+            if (
+                a.get("status") == "pending"
+                and a.get("origin_platform") == platform
+                and a.get("origin_chat_id") == chat_id
+            ):
+                return a
+        return None
 
     # ══════════════════════════════════════════════════════════════════
     # Lifecycle

@@ -93,7 +93,13 @@ class WorkflowRun:
 
 @dataclass
 class PendingAction:
-    """A human-in-the-loop question raised during a workflow run."""
+    """A human-in-the-loop question raised during a workflow run.
+
+    The agent calls ``workflow_wait_for_user(question)`` to pause and ask
+    the human a freeform question.  The human replies directly in the chat
+    where the workflow was created (captured via ``pre_gateway_dispatch``)
+    or via the ``/workflows respond`` slash command.
+    """
 
     id: str
     workflow_id: str
@@ -105,8 +111,18 @@ class PendingAction:
     created_at: float = 0.0
     responded_at: Optional[float] = None
 
+    # ── Timeout ──────────────────────────────────────────────────────
+    expires_at: Optional[float] = None
+    timeout_status: Optional[str] = None  # None | "expired"
+
+    # ── Origin (for chat-based reply capture via pre_gateway_dispatch) ─
+    origin_platform: Optional[str] = None  # "telegram", "discord", etc.
+    origin_chat_id: Optional[str] = None   # chat/room/dm id
+    origin_thread_id: Optional[str] = None  # forum topic / thread id
+    origin_user_id: Optional[str] = None   # user who created the workflow
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "id": self.id,
             "workflow_id": self.workflow_id,
             "run_id": self.run_id,
@@ -116,7 +132,14 @@ class PendingAction:
             "response": self.response,
             "created_at": self.created_at,
             "responded_at": self.responded_at,
+            "expires_at": self.expires_at,
+            "timeout_status": self.timeout_status,
+            "origin_platform": self.origin_platform,
+            "origin_chat_id": self.origin_chat_id,
+            "origin_thread_id": self.origin_thread_id,
+            "origin_user_id": self.origin_user_id,
         }
+        return result
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "PendingAction":
@@ -130,4 +153,10 @@ class PendingAction:
             response=row.get("response"),
             created_at=row.get("created_at", 0.0),
             responded_at=row.get("responded_at"),
+            expires_at=row.get("expires_at"),
+            timeout_status=row.get("timeout_status"),
+            origin_platform=row.get("origin_platform"),
+            origin_chat_id=row.get("origin_chat_id"),
+            origin_thread_id=row.get("origin_thread_id"),
+            origin_user_id=row.get("origin_user_id"),
         )

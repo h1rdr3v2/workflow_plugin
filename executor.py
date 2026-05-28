@@ -103,7 +103,17 @@ def execute(workflow_id: str) -> Dict[str, Any]:
         system_prompt = _build_system_prompt(wf, context)
         user_message = _build_user_message(wf, context)
 
-        # ── 5. Invoke agent ───────────────────────────────────────────
+        # ── 5. Extract origin for chat-based reply capture ────────────
+        origin_kwargs: Dict[str, Any] = {}
+        origin = wf.get("origin")
+        if isinstance(origin, dict):
+            origin_kwargs["origin_platform"] = origin.get("platform") or ""
+            origin_chat_id = origin.get("chat_id")
+            origin_kwargs["origin_chat_id"] = str(origin_chat_id) if origin_chat_id else ""
+            origin_kwargs["origin_thread_id"] = origin.get("thread_id") or ""
+            origin_kwargs["origin_user_id"] = origin.get("user_id") or ""
+
+        # ── 6. Invoke agent ───────────────────────────────────────────
         if _agent_invoke is None:
             raise RuntimeError(
                 "Agent invoke not registered — call executor.set_agent_invoke() "
@@ -115,9 +125,10 @@ def execute(workflow_id: str) -> Dict[str, Any]:
             run_id=run_id,
             system_prompt=system_prompt,
             user_message=user_message,
+            **origin_kwargs,
         )
 
-        # ── 6. Determine outcome ──────────────────────────────────────
+        # ── 7. Determine outcome ──────────────────────────────────────
         # The agent invocation returns a dict; we check if it paused
         finished_at = time.time()
 
@@ -237,9 +248,12 @@ def _build_system_prompt(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
     resolved = context.get("resolved_responses", [])
     if resolved:
         parts.append("\n### Human Responses Since Last Run")
-        parts.append("The following questions were answered by a human. Incorporate these responses into this execution:")
+        parts.append("The following questions were answered by a human (or timed out). Incorporate these into this execution:")
         for r in resolved:
-            parts.append(f"- Q: {r['question']}\n  A: {r['response']}")
+            if r.get("timeout_status") == "expired":
+                parts.append(f"- Q: {r['question']}\n  ⏰ **TIMEOUT** — the human did not respond within the time limit. Proceed without their input.")
+            else:
+                parts.append(f"- Q: {r['question']}\n  A: {r['response']}")
 
     # Inject pending actions
     pending = context.get("pending_actions", [])

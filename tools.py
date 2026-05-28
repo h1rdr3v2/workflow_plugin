@@ -369,9 +369,19 @@ def _handle_delete_state(args: Dict[str, Any], **kwargs: Any) -> str:
 def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
     question = (args.get("question") or "").strip()
     context = (args.get("context") or "").strip() or None
+    max_wait_seconds = args.get("max_wait_seconds")  # optional int timeout
 
     if not question:
         return json.dumps({"error": "question is required"})
+
+    # Validate max_wait_seconds
+    if max_wait_seconds is not None:
+        try:
+            max_wait_seconds = int(max_wait_seconds)
+            if max_wait_seconds <= 0:
+                return json.dumps({"error": "max_wait_seconds must be a positive integer"})
+        except (ValueError, TypeError):
+            return json.dumps({"error": "max_wait_seconds must be an integer"})
 
     current_wf = _get_current_workflow_id(kwargs)
     if not current_wf:
@@ -381,24 +391,44 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
 
     try:
         db = get_db()
+        # Extract origin from kwargs (set by executor/__init__)
+        origin_platform = (kwargs.get("origin_platform") or "").strip() or None
+        origin_chat_id = (kwargs.get("origin_chat_id") or "").strip() or None
+        origin_thread_id = (kwargs.get("origin_thread_id") or "").strip() or None
+        origin_user_id = (kwargs.get("origin_user_id") or "").strip() or None
+
         action = db.create_pending_action(
             workflow_id=current_wf,
             question=question,
             context=context,
+            max_wait_seconds=max_wait_seconds,
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
+            origin_thread_id=origin_thread_id,
+            origin_user_id=origin_user_id,
         )
 
-        return json.dumps({
+        result = {
             "success": True,
             "action_id": action["id"],
             "workflow_id": current_wf,
             "status": "pending",
             "message": (
                 f"Workflow '{current_wf}' is now paused, awaiting human input. "
-                f"The human can respond via the dashboard or /workflows command. "
-                f"IMPORTANT: End this run now. The workflow will resume on the "
-                f"next scheduled tick after the human responds."
+                f"The human can reply directly in this chat or use /workflows. "
+                f"IMPORTANT: End this run now. The workflow will resume "
+                f"immediately after the human responds."
             ),
-        })
+        }
+        if max_wait_seconds:
+            result["max_wait_seconds"] = max_wait_seconds
+            result["expires_at"] = action.get("expires_at")
+            result["message"] += (
+                f" If no response within {max_wait_seconds}s, "
+                f"the workflow will auto-continue."
+            )
+
+        return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": f"Failed to pause workflow: {e}"})
 
