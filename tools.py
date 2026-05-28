@@ -58,12 +58,23 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
-    # Basic cron validation
+    # Basic cron validation — 5 fields
     parts = cron_expression.split()
     if len(parts) != 5:
         return json.dumps({
             "error": f"cron_expression must have exactly 5 fields, got {len(parts)}. Example: '0 9 * * 1-5'"
         })
+
+    # Real cron validation via APScheduler
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        CronTrigger.from_crontab(cron_expression)
+    except (ValueError, KeyError) as e:
+        return json.dumps({
+            "error": f"Invalid cron expression '{cron_expression}': {e}"
+        })
+    except ImportError:
+        pass  # APScheduler not available — skip deep validation
 
     try:
         db = get_db()
@@ -103,7 +114,20 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
         update_kwargs: Dict[str, Any] = {}
         for field in ("name", "description", "cron_expression", "prompt"):
             if field in args and args[field] is not None:
-                update_kwargs[field] = (args[field] or "").strip()
+                val = (args[field] or "").strip()
+                # Validate cron if being updated
+                if field == "cron_expression" and val:
+                    parts = val.split()
+                    if len(parts) != 5:
+                        return json.dumps({"error": f"cron_expression must have exactly 5 fields, got {len(parts)}"})
+                    try:
+                        from apscheduler.triggers.cron import CronTrigger
+                        CronTrigger.from_crontab(val)
+                    except (ValueError, KeyError) as e:
+                        return json.dumps({"error": f"Invalid cron expression '{val}': {e}"})
+                    except ImportError:
+                        pass
+                update_kwargs[field] = val
 
         if "enabled" in args and args["enabled"] is not None:
             update_kwargs["enabled"] = bool(args["enabled"])

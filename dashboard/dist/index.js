@@ -41,6 +41,7 @@
 	function WorkflowFormModal(props) {
 		var onClose = props.onClose
 		var onRefresh = props.onRefresh
+		var onToast = props.onToast
 		var editWf = props.editWorkflow
 
 		var _id = useState(editWf ? editWf.id : ""),
@@ -90,6 +91,19 @@
 					setError("Cron must have exactly 5 fields (e.g. '0 9 * * 1-5').")
 					return
 				}
+				// Validate each cron field matches valid cron patterns
+				var cronFields = cron.trim().split(/\s+/)
+				var cronFieldRe = /^(\*|\d+(-\d+)?(,\d+(-\d+)?)*|\*\/\d+)$/
+				for (var i = 0; i < cronFields.length; i++) {
+					if (!cronFieldRe.test(cronFields[i])) {
+						setError(
+							"Invalid cron field '" +
+								cronFields[i] +
+								"'. Use numbers, '*', ranges like '1-5', lists like '1,3,5', or steps like '*/15'.",
+						)
+						return
+					}
+				}
 				if (!prompt.trim()) {
 					setError("Prompt is required.")
 					return
@@ -118,7 +132,14 @@
 				fetchJSON(url, { method: method, body: JSON.stringify(body) })
 					.then(function () {
 						onClose()
-						onRefresh()
+						onToast(
+							(isEdit ? "Updated" : "Created") +
+								': "' +
+								truncate(name || wfId, 30) +
+								'"',
+							"success",
+						)
+						onRefresh(true)
 					})
 					.catch(function (e) {
 						setError("Failed: " + e.message)
@@ -127,7 +148,17 @@
 						setSaving(false)
 					})
 			},
-			[wfId, name, description, cron, prompt, isEdit, onClose, onRefresh],
+			[
+				wfId,
+				name,
+				description,
+				cron,
+				prompt,
+				isEdit,
+				onClose,
+				onToast,
+				onRefresh,
+			],
 		)
 
 		return React.createElement(
@@ -366,13 +397,14 @@
 					{ method: "DELETE" },
 				)
 					.then(function () {
-						onRefresh()
+						onToast('Deleted: "' + truncate(wf.name, 30) + '"', "success")
+						onRefresh(true)
 					})
 					.catch(function (err) {
 						console.error(err)
 					})
 			},
-			[wf.id, wf.name, onRefresh],
+			[wf.id, wf.name, onToast, onRefresh],
 		)
 
 		var runNow = useCallback(
@@ -1189,6 +1221,7 @@
 				? React.createElement(WorkflowFormModal, {
 						onClose: handleCloseForm,
 						onRefresh: load,
+						onToast: showToast,
 						editWorkflow: editWf,
 					})
 				: null,

@@ -51,6 +51,7 @@ def list_workflows() -> dict:
             "name": wf["name"],
             "description": wf.get("description", ""),
             "cron_expression": wf["cron_expression"],
+            "prompt": wf.get("prompt", ""),
             "enabled": bool(wf["enabled"]),
             "created_at": wf["created_at"],
             "updated_at": wf["updated_at"],
@@ -149,6 +150,16 @@ async def create_workflow(request: Request) -> dict:
     if len(cron_expression.split()) != 5:
         errors.append("cron_expression must have exactly 5 fields")
 
+    # Real cron validation
+    if not errors:
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            CronTrigger.from_crontab(cron_expression)
+        except (ValueError, KeyError) as e:
+            errors.append(f"Invalid cron expression: {e}")
+        except ImportError:
+            pass
+
     if errors:
         return {"error": "; ".join(errors)}
 
@@ -176,7 +187,19 @@ async def update_workflow(workflow_id: str, request: Request) -> dict:
     update_kwargs = {}
     for field in ("name", "description", "cron_expression", "prompt"):
         if field in body and body[field] is not None:
-            update_kwargs[field] = str(body[field]).strip()
+            val = str(body[field]).strip()
+            # Validate cron if being updated
+            if field == "cron_expression" and val:
+                if len(val.split()) != 5:
+                    return {"error": "cron_expression must have exactly 5 fields"}
+                try:
+                    from apscheduler.triggers.cron import CronTrigger
+                    CronTrigger.from_crontab(val)
+                except (ValueError, KeyError) as e:
+                    return {"error": f"Invalid cron expression: {e}"}
+                except ImportError:
+                    pass
+            update_kwargs[field] = val
 
     if "enabled" in body and body["enabled"] is not None:
         update_kwargs["enabled"] = bool(body["enabled"])
