@@ -68,49 +68,8 @@
 		var isEdit = !!editWf
 		var titleText = isEdit ? "Edit Workflow" : "New Workflow"
 
-		// Portal the overlay to document.body so it escapes the plugin
-		// container's stacking context (z-2 vs sidebar's z-50).
-		// Positioned to only cover the content area, not the sidebar.
-		var overlayRef = useState({ current: null })[0]
-		useEffect(function () {
-			var el = overlayRef.current
-			if (!el) return
-
-			function position() {
-				var desktop = window.innerWidth >= 1024
-				el.style.position = "fixed"
-				el.style.top = "0"
-				el.style.right = "0"
-				el.style.bottom = "0"
-				el.style.left = desktop ? "256px" : "0"
-				el.style.zIndex = "99999"
-				el.style.display = "flex"
-				el.style.alignItems = "center"
-				el.style.justifyContent = "center"
-				el.style.padding = "1rem"
-				el.style.background = "rgba(0,0,0,0.55)"
-				el.style.backdropFilter = "blur(4px)"
-			}
-
-			position()
-			window.addEventListener("resize", position)
-
-			if (el.parentNode !== document.body) {
-				document.body.appendChild(el)
-			}
-
-			// Vanilla click-to-close on backdrop
-			el.onclick = function (e) {
-				if (e.target === el) onClose()
-			}
-
-			return function () {
-				window.removeEventListener("resize", position)
-				if (el.parentNode === document.body) {
-					document.body.removeChild(el)
-				}
-			}
-		}, [])
+		var isEdit = !!editWf
+		var titleText = isEdit ? "Edit Workflow" : "New Workflow"
 
 		var submit = useCallback(
 			function () {
@@ -174,8 +133,11 @@
 		return React.createElement(
 			"div",
 			{
-				ref: function (el) {
-					overlayRef.current = el
+				className:
+					"fixed inset-0 z-[99999] flex items-center justify-center p-4",
+				style: { background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" },
+				onClick: function (e) {
+					if (e.target === e.currentTarget) onClose()
 				},
 			},
 			React.createElement(
