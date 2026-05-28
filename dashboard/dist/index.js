@@ -58,9 +58,6 @@
 		var _prompt = useState(editWf ? editWf.prompt || "" : ""),
 			prompt = _prompt[0],
 			setPrompt = _prompt[1]
-		var _enabled = useState(editWf ? editWf.enabled : true),
-			enabled = _enabled[0],
-			setEnabled = _enabled[1]
 		var _saving = useState(false),
 			saving = _saving[0],
 			setSaving = _saving[1]
@@ -70,6 +67,50 @@
 
 		var isEdit = !!editWf
 		var titleText = isEdit ? "Edit Workflow" : "New Workflow"
+
+		// Portal the overlay to document.body so it escapes the plugin
+		// container's stacking context (z-2 vs sidebar's z-50).
+		// Positioned to only cover the content area, not the sidebar.
+		var overlayRef = useState({ current: null })[0]
+		useEffect(function () {
+			var el = overlayRef.current
+			if (!el) return
+
+			function position() {
+				var desktop = window.innerWidth >= 1024
+				el.style.position = "fixed"
+				el.style.top = "0"
+				el.style.right = "0"
+				el.style.bottom = "0"
+				el.style.left = desktop ? "256px" : "0"
+				el.style.zIndex = "99999"
+				el.style.display = "flex"
+				el.style.alignItems = "center"
+				el.style.justifyContent = "center"
+				el.style.padding = "1rem"
+				el.style.background = "rgba(0,0,0,0.55)"
+				el.style.backdropFilter = "blur(4px)"
+			}
+
+			position()
+			window.addEventListener("resize", position)
+
+			if (el.parentNode !== document.body) {
+				document.body.appendChild(el)
+			}
+
+			// Vanilla click-to-close on backdrop
+			el.onclick = function (e) {
+				if (e.target === el) onClose()
+			}
+
+			return function () {
+				window.removeEventListener("resize", position)
+				if (el.parentNode === document.body) {
+					document.body.removeChild(el)
+				}
+			}
+		}, [])
 
 		var submit = useCallback(
 			function () {
@@ -106,7 +147,6 @@
 							description: description,
 							cron_expression: cron,
 							prompt: prompt,
-							enabled: enabled,
 						}
 					: {
 							id: wfId,
@@ -128,27 +168,14 @@
 						setSaving(false)
 					})
 			},
-			[
-				wfId,
-				name,
-				description,
-				cron,
-				prompt,
-				enabled,
-				isEdit,
-				onClose,
-				onRefresh,
-			],
+			[wfId, name, description, cron, prompt, isEdit, onClose, onRefresh],
 		)
 
 		return React.createElement(
 			"div",
 			{
-				className:
-					"fixed inset-0 z-[99999] flex items-center justify-center p-4",
-				style: { background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" },
-				onClick: function (e) {
-					if (e.target === e.currentTarget) onClose()
+				ref: function (el) {
+					overlayRef.current = el
 				},
 			},
 			React.createElement(
@@ -266,31 +293,7 @@
 								placeholder: "0 9 * * 1-5",
 							}),
 						),
-						isEdit
-							? React.createElement(
-									"div",
-									{ className: "grid gap-2" },
-									React.createElement(Label, null, "Status"),
-									React.createElement(
-										"div",
-										{ className: "flex items-center gap-2 pt-2" },
-										React.createElement("input", {
-											type: "checkbox",
-											id: "wf-enabled-modal",
-											checked: enabled,
-											onChange: function (e) {
-												setEnabled(e.target.checked)
-											},
-											className: "rounded",
-										}),
-										React.createElement(
-											Label,
-											{ htmlFor: "wf-enabled-modal" },
-											"Enabled",
-										),
-									),
-								)
-							: React.createElement("div", null),
+						React.createElement("div", null),
 					),
 					React.createElement(
 						"div",
@@ -316,7 +319,7 @@
 				React.createElement(
 					"div",
 					{
-						className: "flex gap-2 justify-end px-5 pb-5",
+						className: "flex gap-2 justify-end px-5 pb-[40px]",
 					},
 					React.createElement(
 						Button,
