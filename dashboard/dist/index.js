@@ -71,25 +71,6 @@
 		var isEdit = !!editWf
 		var titleText = isEdit ? "Edit Workflow" : "New Workflow"
 
-		// Portal the modal overlay to document.body so it escapes
-		// the plugin container and overlays the sidebar.
-		var _overlayNode = useState(null),
-			overlayNode = _overlayNode[0],
-			setOverlayNode = _overlayNode[1]
-		useEffect(
-			function () {
-				if (overlayNode && overlayNode.parentNode !== document.body) {
-					document.body.appendChild(overlayNode)
-				}
-				return function () {
-					if (overlayNode && overlayNode.parentNode) {
-						overlayNode.parentNode.removeChild(overlayNode)
-					}
-				}
-			},
-			[overlayNode],
-		)
-
 		var submit = useCallback(
 			function () {
 				setError("")
@@ -163,9 +144,8 @@
 		return React.createElement(
 			"div",
 			{
-				ref: setOverlayNode,
 				className:
-					"fixed inset-0 z-[9999] flex items-center justify-center p-4",
+					"fixed inset-0 z-[99999] flex items-center justify-center p-4",
 				style: { background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)" },
 				onClick: function (e) {
 					if (e.target === e.currentTarget) onClose()
@@ -1122,12 +1102,15 @@
 				? React.createElement(
 						"div",
 						{
+							role: "status",
+							"aria-live": "polite",
 							className: cn(
-								"fixed bottom-4 right-4 z-[99999] rounded border px-4 py-2 text-sm shadow-lg transition-all",
+								"fixed top-16 right-4 z-[99999] border px-4 py-2.5 font-mono text-xs tracking-wider uppercase backdrop-blur-sm",
 								toast.tone === "error"
-									? "border-red-500/30 bg-red-500/10 text-red-400"
-									: "border-green-500/30 bg-green-500/10 text-green-400",
+									? "bg-destructive/15 text-destructive border-destructive/30"
+									: "bg-success/15 text-success border-success/30",
 							),
+							style: { animation: "toast-in 200ms ease-out" },
 						},
 						toast.message,
 					)
@@ -1174,8 +1157,10 @@
 				},
 				React.createElement(
 					"div",
-					{ className: "flex items-center gap-2 text-sm text-text-tertiary" },
-					"\u23F0 Scheduled Workflows (" + workflows.length + ")",
+					{
+						className: "flex items-center gap-2 text-base text-text-secondary",
+					},
+					"Scheduled Workflows (" + workflows.length + ")",
 				),
 				React.createElement(
 					Button,
