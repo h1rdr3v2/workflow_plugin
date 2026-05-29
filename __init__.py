@@ -459,7 +459,6 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     in-process — no subprocess, no stdout markers, no env var dance.
     workflow_send_message has full gateway access.
     """
-    from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     workflow_id = kw.get("workflow_id", "")
@@ -467,24 +466,19 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
-    # Resolve provider/model/api_key from the user's Hermes config
-    cfg = load_config()
-    model_cfg = cfg.get("model") or {}
-    provider_cfg = cfg.get("provider") or {}
-    model = model_cfg.get("name") or model_cfg.get("model") or cfg.get("model_name", "")
-    provider = provider_cfg.get("name") or cfg.get("provider_name") or ""
-
+    # Resolve provider/model/api_key from the user's Hermes config.
+    # resolve_runtime_provider() reads model.default, model.provider, etc.
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider()
     except Exception as e:
         raise RuntimeError(f"Failed to resolve provider for workflow '{workflow_id}': {e}") from e
 
-    full_prompt = f"{system_prompt}\n\n{user_message}"
-
+    resolved_model = runtime.get("model", "")
+    resolved_provider = runtime.get("provider", "")
     api_key = runtime.get("api_key")
     base_url = runtime.get("base_url")
-    resolved_provider = runtime.get("provider", provider)
-    resolved_model = runtime.get("model", model)
+
+    full_prompt = f"{system_prompt}\n\n{user_message}"
 
     from run_agent import AIAgent
 
