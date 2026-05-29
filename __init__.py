@@ -1,5 +1,5 @@
 """
-Workflow Engine Plugin — Registration.
+Workflow Engine Plugin — Registration. t
 
 The entry point for Hermes. Wires up all 11 tools, hooks, slash commands,
 the scheduler, and the bundled workflow-agent skill.
