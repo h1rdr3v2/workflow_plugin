@@ -564,6 +564,7 @@ def register(ctx: Any) -> None:
 
     # ── Set up agent invocation ───────────────────────────────────────
     executor.set_agent_invoke(_agent_invoke_factory(ctx))
+    scheduler.set_executor(executor.execute)
 
     # ── Register all 14 tools ─────────────────────────────────────────
     schema_map = {

@@ -23,12 +23,63 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from db import get_db  # noqa: E402
 from scheduler import schedule_workflow, unschedule_workflow, get_jobs_status  # noqa: E402
 
-# Import deliver validation from the parent plugin
-from tools import _validate_deliver, VALID_DELIVER_VALUES  # noqa: E402
-
 from fastapi import APIRouter, Request
 
 router = APIRouter()
+
+# ── Deliver validation (inlined from tools.py to avoid relative-import trap) ──
+
+VALID_DELIVER_VALUES = frozenset({"local", "discord", "telegram", "slack", "email", "origin"})
+
+
+def _validate_deliver(deliver_value: str) -> str | None:
+    """Validate a deliver value. Returns error message or None if valid."""
+    v = (deliver_value or "").strip()
+    if not v:
+        return "deliver is required. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    if v not in VALID_DELIVER_VALUES:
+        return "Invalid deliver target '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    return None
+
+
+def _compute_oneshot_cron(trigger_at: str | None, trigger_in: str | None) -> str | None:
+    """Compute an equivalent cron expression for a one-shot trigger."""
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    run_time = None
+
+    if trigger_at:
+        ts = trigger_at.replace("Z", "+00:00")
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z",
+            "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M%z",
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                run_time = datetime.strptime(ts, fmt)
+                if run_time.tzinfo is None:
+                    run_time = run_time.replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+    elif trigger_in:
+        match = re.match(r"^(\d+)\s*(s|m|h|d)$", trigger_in.strip())
+        if match:
+            value, unit = int(match.group(1)), match.group(2)
+            now = datetime.now(timezone.utc)
+            if unit == "s":
+                run_time = now + timedelta(seconds=value)
+            elif unit == "m":
+                run_time = now + timedelta(minutes=value)
+            elif unit == "h":
+                run_time = now + timedelta(hours=value)
+            elif unit == "d":
+                run_time = now + timedelta(days=value)
+
+    if run_time is None:
+        return None
+    return f"{run_time.minute} {run_time.hour} {run_time.day} {run_time.month} *"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -168,7 +219,6 @@ async def create_workflow(request: Request) -> dict:
     if trigger_at or trigger_in:
         trigger_type = "oneshot"
         # Compute cron expression for the one-shot
-        from tools import _compute_oneshot_cron  # noqa: E402
         effective_cron = _compute_oneshot_cron(trigger_at, trigger_in)
         if effective_cron is None:
             errors.append("trigger_at must be a valid ISO 8601 timestamp, or trigger_in must be a duration like '5m', '1h', '30s'")
