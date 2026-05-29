@@ -392,11 +392,13 @@ def _deliver_output(
             if deliver == "local" or not deliver:
                 return  # No gateway delivery needed
             if deliver == "origin":
+                # Use the platform+chat where this workflow was created
                 target_platform = (origin.get("platform") or platform_str).strip()
                 target_chat_id = (origin.get("chat_id") or chat_id).strip()
             elif deliver != platform_str:
-                target_platform = deliver
-                target_chat_id = (origin.get("chat_id") or chat_id).strip()
+                # deliver specifies a different platform than the caller's.
+                # We don't have a chat_id for that platform, so skip.
+                return
     except Exception:
         pass  # Fall back to provided platform/chat_id
 

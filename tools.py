@@ -19,6 +19,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from .db import get_db
+from .lazy_deps import ensure as _ensure_dep, FeatureUnavailable
 from .scheduler import schedule_workflow, unschedule_workflow
 
 logger = logging.getLogger(__name__)
@@ -122,14 +123,15 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
             })
 
         try:
+            _ensure_dep("apscheduler")
             from apscheduler.triggers.cron import CronTrigger
             CronTrigger.from_crontab(effective_cron)
         except (ValueError, KeyError) as e:
             return json.dumps({
                 "error": f"Invalid cron expression '{effective_cron}': {e}"
             })
-        except ImportError:
-            pass  # APScheduler not available — skip deep validation
+        except FeatureUnavailable:
+            pass  # APScheduler not installed — skip deep validation
 
     try:
         db = get_db()
@@ -183,7 +185,7 @@ def _compute_oneshot_cron(
     workflow should fire, or None if the input is invalid.
     """
     import re
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     run_time: Optional[datetime] = None
 
@@ -213,18 +215,12 @@ def _compute_oneshot_cron(
             unit = match.group(2)
             now = datetime.now(timezone.utc)
             if unit == "s":
-                run_time = now.replace(second=now.second + value)
-                # Handle second overflow
-                from datetime import timedelta
                 run_time = now + timedelta(seconds=value)
             elif unit == "m":
-                from datetime import timedelta
                 run_time = now + timedelta(minutes=value)
             elif unit == "h":
-                from datetime import timedelta
                 run_time = now + timedelta(hours=value)
             elif unit == "d":
-                from datetime import timedelta
                 run_time = now + timedelta(days=value)
 
     if run_time is None:
@@ -258,11 +254,12 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
                     if len(parts) != 5:
                         return json.dumps({"error": f"cron_expression must have exactly 5 fields, got {len(parts)}"})
                     try:
+                        _ensure_dep("apscheduler")
                         from apscheduler.triggers.cron import CronTrigger
                         CronTrigger.from_crontab(val)
                     except (ValueError, KeyError) as e:
                         return json.dumps({"error": f"Invalid cron expression '{val}': {e}"})
-                    except ImportError:
+                    except FeatureUnavailable:
                         pass
                 update_kwargs[field] = val
 

@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, Optional
 
+from .lazy_deps import ensure as _ensure_dep, FeatureUnavailable
+
 logger = logging.getLogger(__name__)
 
 # ── Lazy import apscheduler — degrade gracefully if not installed ─────────
@@ -22,17 +24,15 @@ logger = logging.getLogger(__name__)
 _apscheduler_missing: Optional[str] = None
 
 try:
+    _ensure_dep("apscheduler")
     from apscheduler.schedulers.background import BackgroundScheduler  # noqa: F811
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.jobstores.base import JobLookupError
 
     _HAS_APSCHEDULER = True
-except ImportError as e:
+except FeatureUnavailable as e:
     _HAS_APSCHEDULER = False
-    _apscheduler_missing = (
-        f"APScheduler is not installed ({e}). "
-        f"Install it with: pip install apscheduler"
-    )
+    _apscheduler_missing = str(e)
     # Define stubs so the module can still be imported
     BackgroundScheduler = None  # type: ignore[misc]
     CronTrigger = None  # type: ignore[misc]
@@ -326,20 +326,6 @@ def shutdown() -> None:
     if _scheduler is not None and getattr(_scheduler, "running", False):
         _scheduler.shutdown(wait=False)
         logger.info("Workflow scheduler shut down")
-
-
-def get_jobs_status() -> list:
-    """Return a list of scheduled job info dicts for the dashboard API."""
-    if not _HAS_APSCHEDULER or _scheduler is None:
-        return []
-    jobs = []
-    for job in _scheduler.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "name": job.name,
-            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
-        })
-    return jobs
 
 
 # ── Scheduler lifecycle ───────────────────────────────────────────────────
