@@ -459,6 +459,9 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     in-process — no subprocess, no stdout markers, no env var dance.
     workflow_send_message has full gateway access.
     """
+    import os
+    import yaml
+    from pathlib import Path
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     workflow_id = kw.get("workflow_id", "")
@@ -466,16 +469,32 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
-    # Resolve provider/model/api_key from the user's Hermes config.
-    # resolve_runtime_provider() reads model.default, model.provider, etc.
+    # ── Resolve model (same logic as cron/scheduler.py) ──────────────
+    model = os.getenv("HERMES_MODEL", "")
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+    cfg_path = hermes_home / "config.yaml"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            _model_cfg = _cfg.get("model", {})
+            if not model:
+                if isinstance(_model_cfg, str):
+                    model = _model_cfg
+                elif isinstance(_model_cfg, dict):
+                    model = _model_cfg.get("default", model)
+        except Exception:
+            pass
+
+    # ── Resolve provider (api_key omitted — AIAgent resolves internally)
     try:
         runtime = resolve_runtime_provider()
     except Exception as e:
-        raise RuntimeError(f"Failed to resolve provider for workflow '{workflow_id}': {e}") from e
+        raise RuntimeError(
+            f"Failed to resolve provider for workflow '{workflow_id}': {e}"
+        ) from e
 
-    resolved_model = runtime.get("model", "")
     resolved_provider = runtime.get("provider", "")
-    api_key = runtime.get("api_key")
     base_url = runtime.get("base_url")
 
     full_prompt = f"{system_prompt}\n\n{user_message}"
@@ -483,10 +502,9 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     from run_agent import AIAgent
 
     agent = AIAgent(
-        model=resolved_model,
-        api_key=api_key,
-        base_url=base_url,
+        model=model,
         provider=resolved_provider,
+        base_url=base_url,
         enabled_toolsets=["workflow_engine"],
         disabled_toolsets=["cronjob", "delegation"],
         quiet_mode=True,
