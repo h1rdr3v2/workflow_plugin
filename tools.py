@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, Dict, Optional
 
 try:
@@ -771,22 +770,7 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
                 ),
             })
 
-        # ── Subprocess mode: emit stdout marker for parent to deliver ──
-        in_subprocess = bool(os.environ.get("HERMES_WORKFLOW_ID"))
-        if in_subprocess:
-            payload = json.dumps({
-                "platform": target_platform,
-                "chat_id": target_chat_id,
-                "thread_id": origin.get("thread_id"),
-                "message": message,
-            })
-            print(f"__WORKFLOW_DELIVER__:{payload}", flush=True)
-            return json.dumps({
-                "success": True,
-                "message": f"Message queued for delivery to {target_platform}.",
-            })
-
-        # ── Main process mode: use gateway reference ──────────────────
+        # ── Use gateway reference to send ────────────────────────────
         try:
             from .scheduler import _gateway_ref
             gateway = _gateway_ref

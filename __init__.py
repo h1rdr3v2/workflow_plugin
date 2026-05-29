@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -453,93 +451,66 @@ def _agent_invoke_factory(ctx: Any):
 
 
 def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
-    """Internal: invoke the agent via subprocess (``hermes -z``).
+    """Internal: invoke the agent in-process via AIAgent.
 
-    PluginContext does not expose create_session / send_message — we shell
-    out to ``hermes --oneshot`` with the workflow tools.  After the
-    subprocess completes, we parse stdout for ``__WORKFLOW_DELIVER__``
-    markers emitted by the workflow agent and deliver them through the
-    parent process's gateway (which has access to the platform adapters).
+    Follows the same pattern as Hermes cron (cron/scheduler.py):
+    resolve the runtime provider from config, construct AIAgent with
+    the workflow tools, call run_conversation().  Everything runs
+    in-process — no subprocess, no stdout markers, no env var dance.
+    workflow_send_message has full gateway access.
     """
-    import re
-    import subprocess
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
     workflow_id = kw.get("workflow_id", "")
     run_id = kw.get("run_id", "")
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
-    full_prompt = f"{system_prompt}\n\n{user_message}"
+    # Resolve provider/model/api_key from the user's Hermes config
+    cfg = load_config()
+    model_cfg = cfg.get("model") or {}
+    provider_cfg = cfg.get("provider") or {}
+    model = model_cfg.get("name") or model_cfg.get("model") or cfg.get("model_name", "")
+    provider = provider_cfg.get("name") or cfg.get("provider_name") or ""
 
     try:
-        hermes_bin = shutil.which("hermes") or "hermes"
-        env = os.environ.copy()
-        env["HERMES_WORKFLOW_ID"] = workflow_id
-        result = subprocess.run(
-            [hermes_bin, "-z", full_prompt, "-t", "workflow_engine"],
-            capture_output=True, text=True, timeout=300,
-            env=env,
-        )
-
-        output = (result.stdout or "").strip()
-
-        # ── Extract and deliver workflow messages ──────────────────
-        for match in re.finditer(r"__WORKFLOW_DELIVER__:(.*?)$", output, re.MULTILINE):
-            try:
-                payload = json.loads(match.group(1))
-                _deliver_subprocess_message(payload)
-            except Exception:
-                logger.exception("Failed to deliver workflow subprocess message")
-
-        # Strip markers from the output so they don't clutter the summary
-        output = re.sub(
-            r"__WORKFLOW_DELIVER__:.*?$", "", output, flags=re.MULTILINE,
-        ).strip()
-
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            logger.error(
-                "hermes subprocess failed for workflow '%s' (rc=%d): %s",
-                workflow_id, result.returncode, stderr[:500],
-            )
-            raise RuntimeError(
-                f"hermes exited with code {result.returncode}: {stderr[:300]}"
-            )
-
-        return {"summary": output}
-
+        runtime = resolve_runtime_provider(requested=provider)
     except Exception as e:
-        logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
-        raise
+        raise RuntimeError(f"Failed to resolve provider for workflow '{workflow_id}': {e}") from e
 
+    full_prompt = f"{system_prompt}\n\n{user_message}"
 
-def _deliver_subprocess_message(payload: dict) -> None:
-    """Deliver a message emitted by a subprocess workflow agent.
+    api_key = runtime.get("api_key")
+    base_url = runtime.get("base_url")
+    resolved_provider = runtime.get("provider", provider)
+    resolved_model = runtime.get("model", model)
 
-    Uses the parent process's gateway reference (set by the
-    ``pre_gateway_dispatch`` hook).  If the gateway isn't available
-    yet (e.g. cron-fired workflow before any user interaction), logs
-    a warning and skips.
-    """
-    platform = (payload.get("platform") or "").strip()
-    chat_id = (payload.get("chat_id") or "").strip()
-    message = (payload.get("message") or "").strip()
+    from run_agent import AIAgent
 
-    if not platform or not chat_id or not message:
-        return
+    agent = AIAgent(
+        model=resolved_model,
+        api_key=api_key,
+        base_url=base_url,
+        provider=resolved_provider,
+        enabled_toolsets=["workflow_engine"],
+        disabled_toolsets=["cronjob", "delegation"],
+        quiet_mode=True,
+        platform="workflow",
+        session_id=f"wf_{workflow_id}_{run_id}",
+        skip_memory=True,
+        skip_context_files=True,
+    )
 
-    from .scheduler import _gateway_ref
-
-    gateway = _gateway_ref
-    if gateway is None:
-        logger.warning(
-            "Cannot deliver subprocess message to %s/%s: gateway ref not set "
-            "(no pre_gateway_dispatch has fired yet)",
-            platform, chat_id,
-        )
-        return
-
-    _send_via_gateway(gateway, platform, chat_id, message)
+    try:
+        result = agent.run_conversation(full_prompt)
+        summary = ""
+        if isinstance(result, dict):
+            summary = result.get("final_response", "") or result.get("text", "")
+        return {"summary": summary}
+    finally:
+        # AIAgent holds provider connections; let GC handle cleanup
+        pass
 
 
 # ── register() — plugin entry point ───────────────────────────────────────
