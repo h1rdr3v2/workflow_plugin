@@ -47,17 +47,11 @@ def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
     """
     Extract the workflow_id from the execution context.
 
-    Checks (in order):
-    1. ``kwargs["workflow_id"]`` — set by Hermes session metadata
-    2. ``HERMES_WORKFLOW_ID`` env var — set by the workflow subprocess launcher
-
-    For tools called outside a workflow run (e.g. create, list), returns None.
+    In a workflow run, kwargs includes the workflow_id of the currently
+    executing workflow. For tools called outside a workflow run (e.g.,
+    create, list), this returns None.
     """
-    from_kwargs = (kwargs.get("workflow_id") or "").strip()
-    if from_kwargs:
-        return from_kwargs
-    env_id = os.environ.get("HERMES_WORKFLOW_ID", "").strip()
-    return env_id or None
+    return (kwargs.get("workflow_id") or "").strip() or None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
