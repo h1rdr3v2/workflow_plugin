@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import executor, schemas, tools
+from . import scheduler
 from .db import get_db
 from .scheduler import shutdown as scheduler_shutdown
 from .scheduler import start as scheduler_start
@@ -442,59 +444,6 @@ def _send_via_gateway(
 # ── Agent invocation callback ─────────────────────────────────────────────
 
 
-def _agent_invoke(
-    workflow_id: str,
-    run_id: str,
-    system_prompt: str,
-    user_message: str,
-    **extra: Any,
-) -> Dict[str, Any]:
-    """
-    Invoke the Hermes agent for a workflow execution.
-
-    This is called by the executor when a workflow tick fires.
-    The ctx reference is captured at registration time.
-    """
-    ctx = _agent_invoke._ctx  # type: ignore[attr-defined]
-
-    # Build a session that the agent can interact with
-    # The agent receives the system prompt + user message, and can
-    # call tools (save_state, wait_for_user, etc.)
-    try:
-        # Use Hermes's agent invocation API via ctx
-        # ctx.run_agent sends the prompt to the LLM with the registered tools
-        session_id = f"workflow_{workflow_id}_{run_id}"
-
-        # Register the workflow_id in the session context so tools can pick it up
-        # We rely on Hermes passing kwargs through to tool handlers
-        result = ctx.create_session(
-            session_id=session_id,
-            system_prompt=system_prompt,
-            toolset="workflow_engine",
-            metadata={
-                "workflow_id": workflow_id,
-                "run_id": run_id,
-            },
-        )
-
-        if result is None:
-            return {"summary": "Agent session created but no result returned."}
-
-        # Send the user message to kick off the agent
-        response = ctx.send_message(
-            session_id=session_id,
-            message=user_message,
-        )
-
-        return {
-            "summary": response.get("content", "") if response else "",
-        }
-
-    except Exception as e:
-        logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
-        raise
-
-
 def _agent_invoke_factory(ctx: Any):
     """Create a closure that captures ctx for agent invocation."""
     def invoke(**kw: Any) -> Dict[str, Any]:
@@ -503,48 +452,41 @@ def _agent_invoke_factory(ctx: Any):
 
 
 def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
-    """Internal: invoke the agent using the captured Hermes context."""
+    """Internal: invoke the agent via subprocess (``hermes -z``).
+
+    PluginContext does not expose create_session / send_message — we shell
+    out to ``hermes --oneshot`` with the workflow tools, same pattern
+    Hermes cron uses for its agent runs.
+    """
+    import subprocess
+
     workflow_id = kw.get("workflow_id", "")
     run_id = kw.get("run_id", "")
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
-    # Extract origin kwargs so they can reach tool handlers
-    origin_platform = kw.get("origin_platform", "")
-    origin_chat_id = kw.get("origin_chat_id", "")
-    origin_thread_id = kw.get("origin_thread_id", "")
-    origin_user_id = kw.get("origin_user_id", "")
-
-    session_id = f"workflow_{workflow_id}_{run_id}"
+    # Build the full prompt — system prompt first, then user message
+    full_prompt = f"{system_prompt}\n\n{user_message}"
 
     try:
-        # Create a temporary agent session with the workflow's tools.
-        # Origin metadata is stored in session metadata so Hermes can pass
-        # it to tool dispatch if supported, and as a fallback tool handlers
-        # read from executor._active_origins.
-        ctx.create_session(
-            session_id=session_id,
-            system_prompt=system_prompt,
-            toolset="workflow_engine",
-            metadata={
-                "workflow_id": workflow_id,
-                "run_id": run_id,
-                "origin_platform": origin_platform,
-                "origin_chat_id": origin_chat_id,
-                "origin_thread_id": origin_thread_id,
-                "origin_user_id": origin_user_id,
-            },
+        hermes_bin = shutil.which("hermes") or "hermes"
+        result = subprocess.run(
+            [hermes_bin, "-z", "-t", "workflow_engine", full_prompt],
+            capture_output=True, text=True, timeout=300,
         )
 
-        # Send the trigger message
-        response = ctx.send_message(
-            session_id=session_id,
-            message=user_message,
-        )
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            logger.error(
+                "hermes subprocess failed for workflow '%s' (rc=%d): %s",
+                workflow_id, result.returncode, stderr[:500],
+            )
+            raise RuntimeError(
+                f"hermes exited with code {result.returncode}: {stderr[:300]}"
+            )
 
-        return {
-            "summary": response.get("content", "") if response else "",
-        }
+        return {"summary": output}
 
     except Exception as e:
         logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
