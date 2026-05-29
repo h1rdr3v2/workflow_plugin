@@ -14,6 +14,7 @@ Manages:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -234,12 +235,130 @@ def _fire(workflow_id: str) -> None:
     try:
         run_info = _executor(workflow_id)
 
-        # Auto-disable one-shot workflows after they fire
+        # ── Deliver output to the user ────────────────────────────────
         if isinstance(run_info, dict):
+            _deliver_workflow_output(workflow_id, run_info)
+
+            # Auto-disable one-shot workflows after they fire
             _auto_disable_oneshot(workflow_id)
 
     except Exception:
         logger.exception("Unhandled error in executor for workflow '%s'", workflow_id)
+
+
+def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None:
+    """
+    Deliver workflow output to the configured delivery target.
+
+    Mirrors cron's _deliver_result: resolves the delivery target from the
+    workflow's deliver field + origin, then sends via the gateway adapter.
+    """
+    status = run_info.get("status", "")
+    summary = (run_info.get("output_summary") or "").strip()
+
+    # Only deliver on success (not paused, not error, not skipped)
+    if status != "success" or not summary:
+        return
+
+    # ── Load workflow to get deliver + origin ─────────────────────────
+    try:
+        try:
+            from .db import get_db
+        except ImportError:
+            from db import get_db  # noqa: E402
+        db = get_db()
+        wf = db.get_workflow(workflow_id)
+    except Exception:
+        logger.debug("Cannot load workflow for delivery: %s", workflow_id, exc_info=True)
+        return
+
+    if wf is None:
+        return
+
+    deliver = (wf.get("deliver") or "").strip()
+    if deliver == "local" or not deliver:
+        return  # No gateway delivery needed
+
+    origin = wf.get("origin") or {}
+
+    # ── Resolve target platform + chat_id ─────────────────────────────
+    if deliver == "origin":
+        target_platform = (origin.get("platform") or "").strip()
+        target_chat_id = (origin.get("chat_id") or "").strip()
+    else:
+        target_platform = deliver
+        target_chat_id = (origin.get("chat_id") or "").strip()
+        # If deliver specifies a platform but origin doesn't have chat_id,
+        # try env vars (mirrors cron's home-target resolution)
+        if not target_chat_id:
+            target_chat_id = _resolve_home_chat_id(target_platform)
+
+    if not target_platform or not target_chat_id:
+        logger.debug(
+            "Workflow '%s': no delivery target resolved (deliver=%s, origin=%s)",
+            workflow_id, deliver, origin,
+        )
+        return
+
+    # ── Send via gateway adapter ──────────────────────────────────────
+    _send_via_gateway(
+        target_platform,
+        str(target_chat_id),
+        f"📋 **Workflow `{workflow_id}` completed**\n\n{summary}",
+    )
+
+
+def _resolve_home_chat_id(platform_name: str) -> str:
+    """Resolve home chat/channel ID from environment variables for a platform.
+
+    Mirrors cron's _get_home_target_chat_id for common platforms.
+    """
+    env_map = {
+        "telegram": "TELEGRAM_HOME_CHANNEL",
+        "discord": "DISCORD_HOME_CHANNEL",
+        "slack": "SLACK_HOME_CHANNEL",
+        "matrix": "MATRIX_HOME_ROOM",
+        "signal": "SIGNAL_HOME_CHANNEL",
+        "email": "EMAIL_HOME_ADDRESS",
+        "whatsapp": "WHATSAPP_HOME_CHANNEL",
+    }
+    env_var = env_map.get(platform_name.lower(), "")
+    if not env_var:
+        return ""
+    return os.environ.get(env_var, "")
+
+
+def _send_via_gateway(
+    platform_str: str,
+    chat_id: str,
+    message: str,
+) -> None:
+    """Send a message through the gateway adapter matching platform_str.
+
+    Best-effort — never raises, never blocks the scheduler.
+    """
+    global _gateway_ref
+    if _gateway_ref is None:
+        logger.debug("No gateway reference available for delivery to %s", platform_str)
+        return
+
+    try:
+        adapters = getattr(_gateway_ref, "adapters", {}) or {}
+        for plat, adapter in adapters.items():
+            plat_str = plat.value if hasattr(plat, "value") else str(plat)
+            if plat_str.lower() == platform_str.lower():
+                import asyncio
+                loop = getattr(_gateway_ref, "loop", None)
+                if loop and loop.is_running():
+                    async def _send():
+                        try:
+                            await adapter.send(chat_id, message)
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_send(), loop)
+                break
+    except Exception:
+        pass  # Best-effort; don't block on failure
 
 
 # ── Timeout checker ───────────────────────────────────────────────────────

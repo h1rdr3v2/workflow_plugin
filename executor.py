@@ -290,9 +290,12 @@ def _build_system_prompt(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
     parts.append("1. Use **workflow_load_state(key)** to retrieve any saved state you need.")
     parts.append("2. Make decisions based on the context and saved state.")
     parts.append("3. Use **workflow_save_state(key, value)** to persist important data for the next run.")
-    parts.append("4. If you need human input, use **workflow_wait_for_user(question, context)** and then END — do not continue after pausing.")
+    parts.append("4. If you need human input:")
+    parts.append("   a. FIRST use **send_message** or **workflow_send_message** to notify the user with your question.")
+    parts.append("   b. THEN use **workflow_wait_for_user(question, context)** and END — do not continue after pausing.")
     parts.append("5. If you see resolved responses above, incorporate them now.")
-    parts.append("6. Be concise and actionable.")
+    parts.append("6. When your run completes, produce a concise summary as your final response — it will be delivered to the user automatically.")
+    parts.append("7. You have access to ALL hermes-agent tools: terminal, browser, curl/fetch, file operations, etc. Use them freely to accomplish the workflow's goal.")
 
     return "\n".join(parts)
 

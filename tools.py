@@ -75,6 +75,56 @@ def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
     return _WF_CTX.get("workflow_id") or None
 
 
+def _try_notify_user(
+    workflow_id: str,
+    action_id: str,
+    question: str,
+    origin_platform: Optional[str],
+    origin_chat_id: Optional[str],
+) -> None:
+    """Best-effort notification: tell the user there's a pending question.
+
+    Tries to send via the gateway adapter if a reference is available.
+    Never raises, never blocks — if the gateway isn't available yet,
+    the user can still discover pending actions via /workflows.
+    """
+    if not origin_platform or not origin_chat_id:
+        return
+
+    try:
+        from .scheduler import _gateway_ref
+        gateway = _gateway_ref
+    except ImportError:
+        return
+
+    if gateway is None:
+        return
+
+    try:
+        adapters = getattr(gateway, "adapters", {}) or {}
+        for plat, adapter in adapters.items():
+            plat_str = plat.value if hasattr(plat, "value") else str(plat)
+            if plat_str.lower() == origin_platform.lower():
+                import asyncio
+                loop = getattr(gateway, "loop", None)
+                message = (
+                    f"⏳ **Workflow needs your input**\n\n"
+                    f"> {question}\n\n"
+                    f"Reply directly in this chat with your answer, "
+                    f"or use `/workflows respond {action_id} <your answer>`."
+                )
+                if loop and loop.is_running():
+                    async def _send():
+                        try:
+                            await adapter.send(origin_chat_id, message)
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_send(), loop)
+                break
+    except Exception:
+        pass  # Best-effort — never let notification failure block the pause
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. workflow_create
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,6 +667,16 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
             origin_chat_id=origin_chat_id,
             origin_thread_id=origin_thread_id,
             origin_user_id=origin_user_id,
+        )
+
+        # ── Auto-notify: try to send a message to the user so they ────
+        # know there's a pending question.  Best-effort — never blocks.
+        _try_notify_user(
+            workflow_id=current_wf,
+            action_id=action["id"],
+            question=question,
+            origin_platform=origin_platform,
+            origin_chat_id=origin_chat_id,
         )
 
         result = {

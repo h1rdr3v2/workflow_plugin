@@ -1,5 +1,5 @@
 """
-Workflow Engine Plugin — Registration. t
+Workflow Engine Plugin — Registration.
 
 The entry point for Hermes. Wires up all 11 tools, hooks, slash commands,
 the scheduler, and the bundled workflow-agent skill.
@@ -200,28 +200,11 @@ def _handle_workflows_slash(raw_args: str) -> str:
         if result is None:
             return f"⚠️ No pending action found with ID `{action_id}`."
 
-        # Trigger the workflow immediately — don't wait for next cron tick
+        # Trigger the workflow immediately — don't wait for next cron tick.
+        # Output delivery is handled by scheduler._deliver_workflow_output.
         try:
             from .scheduler import trigger_workflow_now
-            run_info = trigger_workflow_now(result["workflow_id"])
-
-            # If there's output to deliver, try to send it
-            if isinstance(run_info, dict) and run_info.get("status") == "success":
-                summary = run_info.get("output_summary", "")
-                if summary:
-                    # Pending action stores origin fields at top level
-                    platform = (result.get("origin_platform") or "").strip()
-                    chat_id = (result.get("origin_chat_id") or "").strip()
-                    if platform and chat_id:
-                        from .scheduler import _gateway_ref
-                        if _gateway_ref:
-                            _deliver_output(
-                                _gateway_ref,
-                                platform,
-                                chat_id,
-                                result["workflow_id"],
-                                summary,
-                            )
+            trigger_workflow_now(result["workflow_id"])
         except Exception:
             pass  # Best-effort; the response is already recorded
 
@@ -319,28 +302,18 @@ def _handle_pre_gateway_dispatch(
             chat_id,
         )
 
-        # Store gateway reference for future use (e.g. sending confirmations)
+        # Store gateway reference for future use (e.g. sending confirmations
+        # and delivering workflow output via the scheduler)
         from .scheduler import set_gateway_ref
         set_gateway_ref(gateway)
 
-        # Trigger the workflow immediately — don't wait for next cron tick
+        # Trigger the workflow immediately — don't wait for next cron tick.
+        # Output delivery is handled by scheduler._deliver_workflow_output.
         from .scheduler import trigger_workflow_now
-        run_info = trigger_workflow_now(action["workflow_id"])
+        trigger_workflow_now(action["workflow_id"])
 
         # Send a confirmation back to the user via the gateway adapter
         _send_confirmation(gateway, platform_str, str(chat_id), action["id"])
-
-        # If the workflow completed with output, deliver it
-        if isinstance(run_info, dict) and run_info.get("status") == "success":
-            summary = run_info.get("output_summary", "")
-            if summary:
-                _deliver_output(
-                    gateway,
-                    platform_str,
-                    str(chat_id),
-                    action["workflow_id"],
-                    summary,
-                )
 
         # Skip — the session agent should not process this message
         return {"action": "skip", "reason": "workflow-response-captured"}
@@ -362,55 +335,6 @@ def _send_confirmation(
         platform_str,
         chat_id,
         f"✅ Got it! Your response has been recorded for the workflow.",
-    )
-
-
-def _deliver_output(
-    gateway: Any,
-    platform_str: str,
-    chat_id: str,
-    workflow_id: str,
-    summary: str,
-) -> None:
-    """Deliver the agent's final output summary to the originating chat.
-
-    Uses the workflow's deliver field to determine routing. Falls back to
-    the provided platform_str / chat_id for backward compatibility with
-    callers that don't pass deliver info.
-    """
-    if not summary or not gateway:
-        return
-
-    # Try to read the deliver field from the workflow for smarter routing
-    target_platform = platform_str
-    target_chat_id = chat_id
-    try:
-        db = get_db()
-        wf = db.get_workflow(workflow_id)
-        if wf:
-            deliver = (wf.get("deliver") or "").strip()
-            origin = wf.get("origin") or {}
-            if deliver == "local" or not deliver:
-                return  # No gateway delivery needed
-            if deliver == "origin":
-                # Use the platform+chat where this workflow was created
-                target_platform = (origin.get("platform") or platform_str).strip()
-                target_chat_id = (origin.get("chat_id") or chat_id).strip()
-            elif deliver != platform_str:
-                # deliver specifies a different platform than the caller's.
-                # We don't have a chat_id for that platform, so skip.
-                return
-    except Exception:
-        pass  # Fall back to provided platform/chat_id
-
-    if not target_platform or not target_chat_id:
-        return
-
-    _send_via_gateway(
-        gateway,
-        target_platform,
-        target_chat_id,
-        f"📋 **Workflow `{workflow_id}` completed**\n\n{summary}",
     )
 
 
@@ -473,6 +397,7 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     model = os.getenv("HERMES_MODEL", "")
     hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
     cfg_path = hermes_home / "config.yaml"
+    _cfg: dict = {}
     if cfg_path.exists():
         try:
             with open(cfg_path, encoding="utf-8") as f:
@@ -504,12 +429,42 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     # Tell tool handlers which workflow this is
     tools.set_workflow_context(workflow_id, run_id)
 
+    # ── Session isolation (mirrors cron's approach) ───────────────────
+    # Clear HERMES_SESSION_* context vars so the workflow agent doesn't
+    # inherit a stale platform/chat_id from a previous gateway session.
+    # Without this, send_message could route to the wrong chat.
+    try:
+        from gateway.session_context import set_session_vars, clear_session_vars
+        set_session_vars(platform="", chat_id="", chat_name="")
+    except Exception:
+        pass
+
+    # ── Resolve disabled toolsets (mirrors cron's _resolve_cron_disabled_toolsets) ──
+    # The workflow agent should have access to ALL hermes-agent tools
+    # (terminal, browser, curl, send_message, etc.) minus a few protected
+    # toolsets that are interactive-only or would let the agent self-modify:
+    #   - cronjob    — would let the agent schedule more cron/workflow jobs
+    #   - messaging  — interactive, needs a live gateway session
+    #   - clarify    — interactive, blocks waiting for user input
+    #   - delegation — would let the agent spawn sub-agents
+    disabled = ["cronjob", "delegation", "messaging", "clarify"]
+    # Layer on user-level disabled_toolsets from config.yaml
+    try:
+        agent_cfg = _cfg.get("agent") or {}
+        user_disabled = agent_cfg.get("disabled_toolsets") or []
+        for name in user_disabled:
+            name = str(name).strip()
+            if name and name not in disabled:
+                disabled.append(name)
+    except Exception:
+        pass
+
     agent = AIAgent(
         model=model,
         provider=resolved_provider,
         base_url=base_url,
-        enabled_toolsets=["workflow_engine"],
-        disabled_toolsets=["cronjob", "delegation"],
+        enabled_toolsets=None,  # All default tools — mirrors cron behavior
+        disabled_toolsets=disabled,
         quiet_mode=True,
         platform="workflow",
         session_id=f"wf_{workflow_id}_{run_id}",
