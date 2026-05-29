@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 # Signature: (workflow_id: str, system_prompt: str, user_message: str, tools: list) -> dict
 _agent_invoke: Optional[Callable[..., Dict[str, Any]]] = None
 
+# ── Origin registry — stores origin kwargs per workflow_id so tool handlers ──
+# can access them even when Hermes doesn't pass them through kwargs.
+# Keyed by workflow_id; cleaned up after each run.
+_active_origins: Dict[str, Dict[str, Any]] = {}
+
+
+def get_active_origin(workflow_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve origin kwargs for a currently-executing workflow."""
+    return _active_origins.get(workflow_id)
+
 
 def set_agent_invoke(fn: Callable[..., Dict[str, Any]]) -> None:
     """Register the agent invocation callback from the Hermes plugin context."""
@@ -113,6 +123,11 @@ def execute(workflow_id: str) -> Dict[str, Any]:
             origin_kwargs["origin_thread_id"] = origin.get("thread_id") or ""
             origin_kwargs["origin_user_id"] = origin.get("user_id") or ""
 
+        # Store origin in the registry so tool handlers (wait_for_user, etc.)
+        # can access it even when Hermes doesn't pass it through kwargs.
+        if origin_kwargs:
+            _active_origins[workflow_id] = origin_kwargs
+
         # ── 6. Invoke agent ───────────────────────────────────────────
         if _agent_invoke is None:
             raise RuntimeError(
@@ -167,6 +182,10 @@ def execute(workflow_id: str) -> Dict[str, Any]:
             "error_message": str(e),
         })
         logger.exception("Workflow '%s' failed with error", workflow_id)
+
+    finally:
+        # Clean up origin registry for this workflow
+        _active_origins.pop(workflow_id, None)
 
     return run_info
 

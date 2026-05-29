@@ -59,6 +59,9 @@
 		var _prompt = useState(editWf ? editWf.prompt || "" : ""),
 			prompt = _prompt[0],
 			setPrompt = _prompt[1]
+		var _deliver = useState(editWf ? editWf.deliver || "local" : "local"),
+			deliver = _deliver[0],
+			setDeliver = _deliver[1]
 		var _saving = useState(false),
 			saving = _saving[0],
 			setSaving = _saving[1]
@@ -120,6 +123,7 @@
 							description: description,
 							cron_expression: cron,
 							prompt: prompt,
+							deliver: deliver,
 						}
 					: {
 							id: wfId,
@@ -127,6 +131,7 @@
 							description: description,
 							cron_expression: cron,
 							prompt: prompt,
+							deliver: deliver,
 						}
 
 				fetchJSON(url, { method: method, body: JSON.stringify(body) })
@@ -154,6 +159,7 @@
 				description,
 				cron,
 				prompt,
+				deliver,
 				isEdit,
 				onClose,
 				onToast,
@@ -261,6 +267,32 @@
 							},
 							placeholder: "What does this workflow do?",
 						}),
+					),
+					React.createElement(
+						"div",
+						{ className: "grid gap-2" },
+						React.createElement(
+							Label,
+							null,
+							"Deliver to",
+							React.createElement("span", { className: "text-red-400" }, " *"),
+						),
+						React.createElement(
+							"select",
+							{
+								value: deliver,
+								onChange: function (e) {
+									setDeliver(e.target.value)
+								},
+								className:
+									"flex h-9 w-full border border-border bg-background/40 px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30",
+							},
+							React.createElement("option", { value: "local" }, "local"),
+							React.createElement("option", { value: "discord" }, "discord"),
+							React.createElement("option", { value: "telegram" }, "telegram"),
+							React.createElement("option", { value: "slack" }, "slack"),
+							React.createElement("option", { value: "email" }, "email"),
+						),
 					),
 					React.createElement(
 						"div",

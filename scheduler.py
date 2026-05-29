@@ -86,6 +86,9 @@ def schedule_workflow(workflow: Dict[str, Any]) -> None:
     """
     Add or update a cron job for a given workflow.
     The job will call the executor with the workflow_id.
+
+    Supports both cron-based (recurring) and one-shot (DateTrigger) workflows.
+    One-shot workflows are auto-disabled after firing.
     """
     if not _HAS_APSCHEDULER:
         logger.warning("Cannot schedule workflow '%s': %s", workflow.get("id", "?"), _apscheduler_missing)
@@ -103,16 +106,52 @@ def schedule_workflow(workflow: Dict[str, Any]) -> None:
         logger.debug("Workflow %s is disabled — not scheduling", workflow["id"])
         return
 
-    try:
-        trigger = CronTrigger.from_crontab(workflow["cron_expression"])
-    except (ValueError, KeyError) as e:
-        logger.error(
-            "Invalid cron expression for workflow %s: %s — %s",
-            workflow["id"],
-            workflow["cron_expression"],
-            e,
-        )
-        return
+    trigger_type = workflow.get("trigger_type", "cron")
+
+    if trigger_type == "oneshot":
+        # Use DateTrigger for one-shot workflows
+        try:
+            from apscheduler.triggers.date import DateTrigger
+            from datetime import datetime, timezone
+
+            # Parse the cron expression back to a datetime
+            # The cron was generated as "minute hour day month *"
+            parts = workflow["cron_expression"].split()
+            if len(parts) == 5:
+                run_time = datetime(
+                    year=datetime.now(timezone.utc).year,
+                    month=int(parts[3]),
+                    day=int(parts[2]),
+                    hour=int(parts[1]),
+                    minute=int(parts[0]),
+                )
+            else:
+                logger.error("Invalid one-shot cron for %s: %s", workflow["id"], workflow["cron_expression"])
+                return
+
+            # If the computed time is in the past, it'll fire immediately
+            trigger = DateTrigger(run_date=run_time)
+        except ImportError:
+            logger.warning("DateTrigger not available, falling back to cron for '%s'", workflow["id"])
+            try:
+                trigger = CronTrigger.from_crontab(workflow["cron_expression"])
+            except (ValueError, KeyError) as e:
+                logger.error("Invalid cron for '%s': %s — %s", workflow["id"], workflow["cron_expression"], e)
+                return
+        except Exception as e:
+            logger.error("Failed to create DateTrigger for '%s': %s", workflow["id"], e)
+            return
+    else:
+        try:
+            trigger = CronTrigger.from_crontab(workflow["cron_expression"])
+        except (ValueError, KeyError) as e:
+            logger.error(
+                "Invalid cron expression for workflow %s: %s — %s",
+                workflow["id"],
+                workflow["cron_expression"],
+                e,
+            )
+            return
 
     scheduler.add_job(
         _tick,
@@ -128,9 +167,10 @@ def schedule_workflow(workflow: Dict[str, Any]) -> None:
     next_run = job.next_run_time.isoformat() if job and job.next_run_time else "unknown"
 
     logger.info(
-        "Scheduled workflow '%s' (%s): cron='%s' next_run=%s",
+        "Scheduled workflow '%s' (%s): type=%s cron='%s' next_run=%s",
         workflow["name"],
         workflow["id"],
+        trigger_type,
         workflow["cron_expression"],
         next_run,
     )
@@ -161,7 +201,7 @@ def _tick(workflow_id: str) -> None:
     Called by APScheduler when a workflow's cron trigger fires.
 
     Dispatches to the executor. If no executor is registered, logs
-    a warning and skips.
+    a warning and skips.  After execution, auto-disables one-shot workflows.
     """
     if _executor is None:
         logger.warning(
@@ -172,7 +212,12 @@ def _tick(workflow_id: str) -> None:
 
     logger.info("Workflow tick: %s", workflow_id)
     try:
-        _executor(workflow_id)
+        run_info = _executor(workflow_id)
+
+        # Auto-disable one-shot workflows after they fire
+        if isinstance(run_info, dict):
+            _auto_disable_oneshot(workflow_id)
+
     except Exception:
         logger.exception("Unhandled error in executor for workflow '%s'", workflow_id)
 
@@ -192,31 +237,60 @@ def set_gateway_ref(gateway: Any) -> None:
     _gateway_ref = gateway
 
 
-def trigger_workflow_now(workflow_id: str) -> bool:
+def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
     """
     Trigger a workflow execution immediately, bypassing the cron schedule.
 
     Called when a human responds to a pending action — we don't want to
     wait for the next cron tick. The overlap protection still applies:
     if a run is already active (another pending action unresolved), skip.
+
+    Returns the run_info dict from executor.execute(), or None on failure.
+    Auto-disables one-shot workflows after execution.
     """
     if _executor is None:
         logger.warning(
             "trigger_workflow_now for '%s' but no executor registered",
             workflow_id,
         )
-        return False
+        return None
 
     logger.info("Immediate trigger: %s", workflow_id)
     try:
-        _executor(workflow_id)
-        return True
+        run_info = _executor(workflow_id)
+
+        # Auto-disable one-shot workflows after they fire
+        if isinstance(run_info, dict):
+            _auto_disable_oneshot(workflow_id)
+
+        return run_info
     except Exception:
         logger.exception(
             "Unhandled error in immediate trigger for workflow '%s'",
             workflow_id,
         )
-        return False
+        return None
+
+
+def _auto_disable_oneshot(workflow_id: str) -> None:
+    """
+    If a workflow is a one-shot, disable it after it fires so it doesn't
+    repeat on the equivalent cron.
+    """
+    try:
+        from .db import get_db
+        db = get_db()
+        wf = db.get_workflow(workflow_id)
+        if wf and wf.get("trigger_type") == "oneshot" and wf.get("enabled"):
+            logger.info("Auto-disabling one-shot workflow: %s", workflow_id)
+            updated = db.update_workflow(workflow_id, enabled=False)
+            if updated is not None:
+                unschedule_workflow(workflow_id)
+    except Exception:
+        logger.exception(
+            "Failed to auto-disable one-shot workflow '%s'",
+            workflow_id,
+        )
 
 
 def _timeout_checker() -> None:

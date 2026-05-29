@@ -23,6 +23,9 @@ class Workflow:
     prompt: str
     description: str = ""
     enabled: bool = True
+    origin: Optional[Dict[str, Any]] = None
+    trigger_type: str = "cron"  # "cron" | "oneshot"
+    deliver: str = "local"  # "local" | "telegram" | "discord" | "slack" | "email" | "origin"
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -34,6 +37,9 @@ class Workflow:
             "cron_expression": self.cron_expression,
             "prompt": self.prompt,
             "enabled": self.enabled,
+            "origin": self.origin,
+            "trigger_type": self.trigger_type,
+            "deliver": self.deliver,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -47,6 +53,9 @@ class Workflow:
             cron_expression=row["cron_expression"],
             prompt=row["prompt"],
             enabled=bool(row.get("enabled", True)),
+            origin=row.get("origin"),
+            trigger_type=row.get("trigger_type", "cron"),
+            deliver=row.get("deliver", "local"),
             created_at=row.get("created_at", 0.0),
             updated_at=row.get("updated_at", 0.0),
         )

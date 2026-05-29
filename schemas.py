@@ -24,7 +24,12 @@ WORKFLOW_CREATE = {
         "underscores, no spaces). The cron_expression is a standard 5-field "
         "cron string (e.g., '0 9 * * 1-5' for weekdays at 9am). The prompt "
         "should be a clear system instruction telling the agent what to do "
-        "on each run."
+        "on each run.\n\n"
+        "For ONE-SHOT workflows, provide trigger_at (ISO timestamp) or "
+        "trigger_in (duration like '5m', '1h', '30s') instead of a "
+        "cron_expression. One-shot workflows auto-disable after firing.\n\n"
+        "Provide 'origin' to enable chat-based reply capture: "
+        '{"platform": "discord", "chat_id": "123", "thread_id": "456"}.'
     ),
     "parameters": {
         "type": "object",
@@ -39,7 +44,7 @@ WORKFLOW_CREATE = {
             },
             "cron_expression": {
                 "type": "string",
-                "description": "Standard 5-field cron expression. E.g., '0 9 * * 1-5' (weekdays at 9am), '*/30 * * * *' (every 30 minutes), '0 0 1 * *' (midnight on the 1st of each month).",
+                "description": "Standard 5-field cron expression. E.g., '0 9 * * 1-5' (weekdays at 9am), '*/30 * * * *' (every 30 minutes), '0 0 1 * *' (midnight on the 1st of each month). NOT required if trigger_at or trigger_in is provided.",
             },
             "prompt": {
                 "type": "string",
@@ -49,8 +54,31 @@ WORKFLOW_CREATE = {
                 "type": "string",
                 "description": "Optional: a short description of what this workflow does. Shown in the dashboard.",
             },
+            "trigger_at": {
+                "type": "string",
+                "description": "Optional: ISO 8601 timestamp for a ONE-SHOT run. E.g., '2026-05-29T14:30:00Z'. The workflow fires once at this time then auto-disables.",
+            },
+            "trigger_in": {
+                "type": "string",
+                "description": "Optional: duration string for a ONE-SHOT run. E.g., '5m', '1h', '30s', '2d'. The workflow fires once after this delay then auto-disables.",
+            },
+            "origin": {
+                "type": "object",
+                "description": "Optional: where this workflow was created. Enables chat-based reply capture. E.g., {'platform': 'discord', 'chat_id': '123456'}. Fields: platform, chat_id, thread_id, user_id (all optional strings).",
+                "properties": {
+                    "platform": {"type": "string", "description": "Platform name: 'discord', 'telegram', 'slack', etc."},
+                    "chat_id": {"type": "string", "description": "Chat/channel/DM ID where responses are captured."},
+                    "thread_id": {"type": "string", "description": "Optional: thread/forum topic ID."},
+                    "user_id": {"type": "string", "description": "Optional: user who created the workflow."},
+                },
+            },
+            "deliver": {
+                "type": "string",
+                "description": "Where to deliver workflow output and messages. 'local', 'discord', 'telegram', 'slack', 'email', or 'origin' (agent-only — uses creation context).",
+                "enum": ["local", "discord", "telegram", "slack", "email", "origin"],
+            },
         },
-        "required": ["workflow_id", "name", "cron_expression", "prompt"],
+        "required": ["workflow_id", "name", "prompt", "deliver"],
     },
 }
 
@@ -62,7 +90,7 @@ WORKFLOW_UPDATE = {
     "name": "workflow_update",
     "description": (
         "Update an existing workflow — change its schedule, prompt, name, "
-        "or enable/disable it. Only the workflow_id is required; all other "
+        "origin, or enable/disable it. Only the workflow_id is required; all other "
         "fields are optional and only updated if provided.\n\n"
         "Use this when a user wants to modify a workflow's behavior, pause "
         "it temporarily, or change its run frequency."
@@ -93,6 +121,21 @@ WORKFLOW_UPDATE = {
             "enabled": {
                 "type": "boolean",
                 "description": "Optional: set to true to enable, false to pause/disable.",
+            },
+            "origin": {
+                "type": "object",
+                "description": "Optional: update the origin platform/chat info for reply capture.",
+                "properties": {
+                    "platform": {"type": "string"},
+                    "chat_id": {"type": "string"},
+                    "thread_id": {"type": "string"},
+                    "user_id": {"type": "string"},
+                },
+            },
+            "deliver": {
+                "type": "string",
+                "description": "Optional: update delivery target. 'local', 'discord', 'telegram', 'slack', 'email', or 'origin' (agent-only).",
+                "enum": ["local", "discord", "telegram", "slack", "email", "origin"],
             },
         },
         "required": ["workflow_id"],
@@ -352,6 +395,82 @@ WORKFLOW_LIST_PENDING = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 12. workflow_send_message
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_SEND_MESSAGE = {
+    "name": "workflow_send_message",
+    "description": (
+        "Send a message to the chat where this workflow was created. "
+        "Use this to give the user a status update, share results, or "
+        "communicate mid-run without pausing for input.\n\n"
+        "Only works if the workflow has an 'origin' configured (the "
+        "platform and chat_id where it was created).\n\n"
+        "The workflow_id is automatically inferred from the current "
+        "execution context — you only need to provide the message."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "The message to send to the originating chat. Can include markdown formatting.",
+            },
+        },
+        "required": ["message"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13. workflow_disable
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_DISABLE = {
+    "name": "workflow_disable",
+    "description": (
+        "Disable/pause a workflow so it stops running on its schedule. "
+        "The workflow will not fire again until re-enabled with "
+        "workflow_enable. The current run (if any) will complete.\n\n"
+        "Use this when a workflow has completed its task, should be "
+        "suspended temporarily, or when a one-shot workflow finishes. "
+        "A workflow CAN disable itself — just pass its own workflow_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "The ID of the workflow to disable/pause.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14. workflow_enable
+# ═══════════════════════════════════════════════════════════════════════════
+
+WORKFLOW_ENABLE = {
+    "name": "workflow_enable",
+    "description": (
+        "Re-enable a previously disabled/paused workflow so it resumes "
+        "running on its regular schedule.\n\n"
+        "Use this to restart a workflow that was paused."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "The ID of the workflow to re-enable.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # All schemas
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -367,4 +486,7 @@ ALL_SCHEMAS = [
     WORKFLOW_WAIT_FOR_USER,
     WORKFLOW_SUBMIT_RESPONSE,
     WORKFLOW_LIST_PENDING,
+    WORKFLOW_SEND_MESSAGE,
+    WORKFLOW_DISABLE,
+    WORKFLOW_ENABLE,
 ]

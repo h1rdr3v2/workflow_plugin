@@ -116,9 +116,16 @@ class WorkflowDB:
         cron_expression: str,
         prompt: str,
         description: str = "",
+        origin: Optional[Dict[str, Any]] = None,
+        trigger_type: str = "cron",
+        deliver: str = "local",
     ) -> Dict[str, Any]:
         """Create a new workflow. Raises ValueError if id already exists."""
         now = time.time()
+
+        # Origin is always stored as-is — no silent default.
+        # Callers (tools / dashboard) are responsible for providing it
+        # or leaving it None when not applicable.
 
         with self._lock:
             workflows = _read_json(self._workflows_path) or []
@@ -133,13 +140,16 @@ class WorkflowDB:
                 "cron_expression": cron_expression,
                 "prompt": prompt,
                 "enabled": True,
+                "origin": origin,
+                "trigger_type": trigger_type,
+                "deliver": deliver,
                 "created_at": now,
                 "updated_at": now,
             }
             workflows.append(wf)
             _write_json(self._workflows_path, workflows)
 
-        logger.info("Workflow created: id=%s", workflow_id)
+        logger.info("Workflow created: id=%s trigger_type=%s deliver=%s", workflow_id, trigger_type, deliver)
         return wf
 
     def get_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
@@ -167,6 +177,9 @@ class WorkflowDB:
         cron_expression: Optional[str] = None,
         prompt: Optional[str] = None,
         enabled: Optional[bool] = None,
+        origin: Optional[Dict[str, Any]] = None,
+        trigger_type: Optional[str] = None,
+        deliver: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update fields on an existing workflow. Returns updated dict or None."""
         now = time.time()
@@ -185,6 +198,12 @@ class WorkflowDB:
                         w["prompt"] = prompt
                     if enabled is not None:
                         w["enabled"] = bool(enabled)
+                    if origin is not None:
+                        w["origin"] = origin
+                    if trigger_type is not None:
+                        w["trigger_type"] = trigger_type
+                    if deliver is not None:
+                        w["deliver"] = deliver
                     w["updated_at"] = now
                     _write_json(self._workflows_path, workflows)
                     logger.info("Workflow updated: id=%s", workflow_id)

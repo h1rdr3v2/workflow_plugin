@@ -202,7 +202,25 @@ def _handle_workflows_slash(raw_args: str) -> str:
         # Trigger the workflow immediately — don't wait for next cron tick
         try:
             from .scheduler import trigger_workflow_now
-            trigger_workflow_now(result["workflow_id"])
+            run_info = trigger_workflow_now(result["workflow_id"])
+
+            # If there's output to deliver, try to send it
+            if isinstance(run_info, dict) and run_info.get("status") == "success":
+                summary = run_info.get("output_summary", "")
+                if summary:
+                    # Pending action stores origin fields at top level
+                    platform = (result.get("origin_platform") or "").strip()
+                    chat_id = (result.get("origin_chat_id") or "").strip()
+                    if platform and chat_id:
+                        from .scheduler import _gateway_ref
+                        if _gateway_ref:
+                            _deliver_output(
+                                _gateway_ref,
+                                platform,
+                                chat_id,
+                                result["workflow_id"],
+                                summary,
+                            )
         except Exception:
             pass  # Best-effort; the response is already recorded
 
@@ -306,10 +324,22 @@ def _handle_pre_gateway_dispatch(
 
         # Trigger the workflow immediately — don't wait for next cron tick
         from .scheduler import trigger_workflow_now
-        trigger_workflow_now(action["workflow_id"])
+        run_info = trigger_workflow_now(action["workflow_id"])
 
         # Send a confirmation back to the user via the gateway adapter
         _send_confirmation(gateway, platform_str, str(chat_id), action["id"])
+
+        # If the workflow completed with output, deliver it
+        if isinstance(run_info, dict) and run_info.get("status") == "success":
+            summary = run_info.get("output_summary", "")
+            if summary:
+                _deliver_output(
+                    gateway,
+                    platform_str,
+                    str(chat_id),
+                    action["workflow_id"],
+                    summary,
+                )
 
         # Skip — the session agent should not process this message
         return {"action": "skip", "reason": "workflow-response-captured"}
@@ -326,28 +356,85 @@ def _send_confirmation(
     action_id: str,
 ) -> None:
     """Try to send a confirmation message that the workflow response was captured."""
+    _send_via_gateway(
+        gateway,
+        platform_str,
+        chat_id,
+        f"✅ Got it! Your response has been recorded for the workflow.",
+    )
+
+
+def _deliver_output(
+    gateway: Any,
+    platform_str: str,
+    chat_id: str,
+    workflow_id: str,
+    summary: str,
+) -> None:
+    """Deliver the agent's final output summary to the originating chat.
+
+    Uses the workflow's deliver field to determine routing. Falls back to
+    the provided platform_str / chat_id for backward compatibility with
+    callers that don't pass deliver info.
+    """
+    if not summary or not gateway:
+        return
+
+    # Try to read the deliver field from the workflow for smarter routing
+    target_platform = platform_str
+    target_chat_id = chat_id
+    try:
+        db = get_db()
+        wf = db.get_workflow(workflow_id)
+        if wf:
+            deliver = (wf.get("deliver") or "").strip()
+            origin = wf.get("origin") or {}
+            if deliver == "local" or not deliver:
+                return  # No gateway delivery needed
+            if deliver == "origin":
+                target_platform = (origin.get("platform") or platform_str).strip()
+                target_chat_id = (origin.get("chat_id") or chat_id).strip()
+            elif deliver != platform_str:
+                target_platform = deliver
+                target_chat_id = (origin.get("chat_id") or chat_id).strip()
+    except Exception:
+        pass  # Fall back to provided platform/chat_id
+
+    if not target_platform or not target_chat_id:
+        return
+
+    _send_via_gateway(
+        gateway,
+        target_platform,
+        target_chat_id,
+        f"📋 **Workflow `{workflow_id}` completed**\n\n{summary}",
+    )
+
+
+def _send_via_gateway(
+    gateway: Any,
+    platform_str: str,
+    chat_id: str,
+    message: str,
+) -> None:
+    """Send a message through the gateway adapter matching platform_str."""
     try:
         adapters = getattr(gateway, "adapters", {}) or {}
-        # Platform enum values are lowercase; find matching adapter
         for plat, adapter in adapters.items():
             plat_str = plat.value if hasattr(plat, "value") else str(plat)
             if plat_str.lower() == platform_str.lower():
-                # Schedule the send in the gateway's event loop
                 import asyncio
                 loop = getattr(gateway, "loop", None)
                 if loop and loop.is_running():
                     async def _send():
                         try:
-                            await adapter.send(
-                                chat_id,
-                                f"✅ Got it! Your response has been recorded for the workflow.",
-                            )
+                            await adapter.send(chat_id, message)
                         except Exception:
                             pass
                     asyncio.run_coroutine_threadsafe(_send(), loop)
                 break
     except Exception:
-        pass  # Confirmation is best-effort; don't block on failure
+        pass  # Best-effort; don't block on failure
 
 
 # ── Agent invocation callback ─────────────────────────────────────────────
@@ -420,10 +507,19 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
+    # Extract origin kwargs so they can reach tool handlers
+    origin_platform = kw.get("origin_platform", "")
+    origin_chat_id = kw.get("origin_chat_id", "")
+    origin_thread_id = kw.get("origin_thread_id", "")
+    origin_user_id = kw.get("origin_user_id", "")
+
     session_id = f"workflow_{workflow_id}_{run_id}"
 
     try:
-        # Create a temporary agent session with the workflow's tools
+        # Create a temporary agent session with the workflow's tools.
+        # Origin metadata is stored in session metadata so Hermes can pass
+        # it to tool dispatch if supported, and as a fallback tool handlers
+        # read from executor._active_origins.
         ctx.create_session(
             session_id=session_id,
             system_prompt=system_prompt,
@@ -431,6 +527,10 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
             metadata={
                 "workflow_id": workflow_id,
                 "run_id": run_id,
+                "origin_platform": origin_platform,
+                "origin_chat_id": origin_chat_id,
+                "origin_thread_id": origin_thread_id,
+                "origin_user_id": origin_user_id,
             },
         )
 
@@ -463,7 +563,7 @@ def register(ctx: Any) -> None:
     # ── Set up agent invocation ───────────────────────────────────────
     executor.set_agent_invoke(_agent_invoke_factory(ctx))
 
-    # ── Register all 11 tools ─────────────────────────────────────────
+    # ── Register all 14 tools ─────────────────────────────────────────
     schema_map = {
         "workflow_create": schemas.WORKFLOW_CREATE,
         "workflow_update": schemas.WORKFLOW_UPDATE,
@@ -476,6 +576,9 @@ def register(ctx: Any) -> None:
         "workflow_wait_for_user": schemas.WORKFLOW_WAIT_FOR_USER,
         "workflow_submit_response": schemas.WORKFLOW_SUBMIT_RESPONSE,
         "workflow_list_pending": schemas.WORKFLOW_LIST_PENDING,
+        "workflow_send_message": schemas.WORKFLOW_SEND_MESSAGE,
+        "workflow_disable": schemas.WORKFLOW_DISABLE,
+        "workflow_enable": schemas.WORKFLOW_ENABLE,
     }
 
     for name, schema in schema_map.items():

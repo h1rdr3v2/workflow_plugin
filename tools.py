@@ -16,12 +16,25 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .db import get_db
 from .scheduler import schedule_workflow, unschedule_workflow
 
 logger = logging.getLogger(__name__)
+
+# ── Valid delivery targets ───────────────────────────────────────────────
+VALID_DELIVER_VALUES = frozenset({"local", "discord", "telegram", "slack", "email", "origin"})
+
+
+def _validate_deliver(deliver_value: str) -> str | None:
+    """Validate a deliver value. Returns error message or None if valid."""
+    v = (deliver_value or "").strip()
+    if not v:
+        return "deliver is required. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    if v not in VALID_DELIVER_VALUES:
+        return "Invalid deliver target '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -47,54 +60,178 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
     cron_expression = (args.get("cron_expression") or "").strip()
     prompt = (args.get("prompt") or "").strip()
     description = (args.get("description") or "").strip()
+    trigger_at = (args.get("trigger_at") or "").strip() or None
+    trigger_in = (args.get("trigger_in") or "").strip() or None
+
+    # Extract origin from args (always present — db.create_workflow defaults to {"platform": "web"})
+    origin_raw = args.get("origin")
+    origin: Optional[Dict[str, Any]] = None
+    if isinstance(origin_raw, dict):
+        origin = {
+            "platform": (origin_raw.get("platform") or "").strip() or None,
+            "chat_id": (origin_raw.get("chat_id") or "").strip() or None,
+            "thread_id": (origin_raw.get("thread_id") or "").strip() or None,
+            "user_id": (origin_raw.get("user_id") or "").strip() or None,
+        }
+        # Remove None values
+        origin = {k: v for k, v in origin.items() if v is not None}
+        if not origin:
+            origin = None
+
+    # Extract delivery target — required, no default
+    deliver = (args.get("deliver") or "").strip()
 
     # Validation
     if not workflow_id:
         return json.dumps({"error": "workflow_id is required"})
     if not name:
         return json.dumps({"error": "name is required"})
-    if not cron_expression:
-        return json.dumps({"error": "cron_expression is required"})
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
-    # Basic cron validation — 5 fields
-    parts = cron_expression.split()
-    if len(parts) != 5:
-        return json.dumps({
-            "error": f"cron_expression must have exactly 5 fields, got {len(parts)}. Example: '0 9 * * 1-5'"
-        })
+    # Validate deliver
+    deliver_error = _validate_deliver(deliver)
+    if deliver_error:
+        return json.dumps({"error": deliver_error})
 
-    # Real cron validation via APScheduler
-    try:
-        from apscheduler.triggers.cron import CronTrigger
-        CronTrigger.from_crontab(cron_expression)
-    except (ValueError, KeyError) as e:
-        return json.dumps({
-            "error": f"Invalid cron expression '{cron_expression}': {e}"
-        })
-    except ImportError:
-        pass  # APScheduler not available — skip deep validation
+    # Determine trigger type: cron, one-shot by timestamp, or one-shot by duration
+    trigger_type = "cron"
+
+    if trigger_at or trigger_in:
+        trigger_type = "oneshot"
+        # Compute a run-at time for the one-shot
+        effective_cron = _compute_oneshot_cron(trigger_at, trigger_in)
+        if effective_cron is None:
+            return json.dumps({
+                "error": (
+                    "trigger_at must be a valid ISO 8601 timestamp "
+                    "(e.g. '2026-05-29T14:30:00Z'), or trigger_in must be "
+                    "a duration string (e.g. '5m', '1h', '30s')."
+                )
+            })
+    else:
+        # Cron mode — require and validate the expression
+        if not cron_expression:
+            return json.dumps({"error": "cron_expression is required when trigger_at and trigger_in are not provided"})
+
+        effective_cron = cron_expression
+        parts = effective_cron.split()
+        if len(parts) != 5:
+            return json.dumps({
+                "error": f"cron_expression must have exactly 5 fields, got {len(parts)}. Example: '0 9 * * 1-5'"
+            })
+
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            CronTrigger.from_crontab(effective_cron)
+        except (ValueError, KeyError) as e:
+            return json.dumps({
+                "error": f"Invalid cron expression '{effective_cron}': {e}"
+            })
+        except ImportError:
+            pass  # APScheduler not available — skip deep validation
 
     try:
         db = get_db()
-        wf = db.create_workflow(workflow_id, name, cron_expression, prompt, description)
+        wf = db.create_workflow(
+            workflow_id,
+            name,
+            effective_cron,
+            prompt,
+            description,
+            origin=origin,
+            trigger_type=trigger_type,
+            deliver=deliver,
+        )
 
-        # Schedule it immediately
+        # Schedule it immediately (handles both cron and one-shot DateTrigger)
         schedule_workflow(wf)
+
+        trigger_desc = effective_cron
+        if trigger_type == "oneshot":
+            if trigger_in:
+                trigger_desc = f"in {trigger_in}"
+            elif trigger_at:
+                trigger_desc = f"at {trigger_at}"
 
         return json.dumps({
             "success": True,
             "workflow_id": workflow_id,
             "name": name,
-            "cron_expression": cron_expression,
-            "message": f"Workflow '{name}' created and scheduled with cron '{cron_expression}'. It will run automatically on schedule.",
+            "cron_expression": effective_cron,
+            "trigger_type": trigger_type,
+            "message": (
+                f"Workflow '{name}' created. "
+                f"It will run {trigger_desc}."
+            ),
         })
     except ValueError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
         logger.exception("Failed to create workflow '%s'", workflow_id)
         return json.dumps({"error": f"Failed to create workflow: {e}"})
+
+
+def _compute_oneshot_cron(
+    trigger_at: Optional[str],
+    trigger_in: Optional[str],
+) -> Optional[str]:
+    """
+    Compute an equivalent cron expression for a one-shot trigger.
+
+    Returns a 5-field cron string representing the exact minute the
+    workflow should fire, or None if the input is invalid.
+    """
+    import re
+    from datetime import datetime, timezone
+
+    run_time: Optional[datetime] = None
+
+    if trigger_at:
+        # Try parsing ISO 8601
+        ts = trigger_at.replace("Z", "+00:00")
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M%z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M%z",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                run_time = datetime.strptime(ts, fmt)
+                if run_time.tzinfo is None:
+                    run_time = run_time.replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+    elif trigger_in:
+        # Parse duration string like "5m", "1h", "30s", "2d"
+        match = re.match(r"^(\d+)\s*(s|m|h|d)$", trigger_in.strip())
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            now = datetime.now(timezone.utc)
+            if unit == "s":
+                run_time = now.replace(second=now.second + value)
+                # Handle second overflow
+                from datetime import timedelta
+                run_time = now + timedelta(seconds=value)
+            elif unit == "m":
+                from datetime import timedelta
+                run_time = now + timedelta(minutes=value)
+            elif unit == "h":
+                from datetime import timedelta
+                run_time = now + timedelta(hours=value)
+            elif unit == "d":
+                from datetime import timedelta
+                run_time = now + timedelta(days=value)
+
+    if run_time is None:
+        return None
+
+    # Return a cron that matches exactly this minute
+    return f"{run_time.minute} {run_time.hour} {run_time.day} {run_time.month} *"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -131,6 +268,27 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
 
         if "enabled" in args and args["enabled"] is not None:
             update_kwargs["enabled"] = bool(args["enabled"])
+
+        # Handle origin update
+        if "origin" in args and args["origin"] is not None:
+            origin_raw = args["origin"]
+            if isinstance(origin_raw, dict):
+                origin_clean = {
+                    "platform": (origin_raw.get("platform") or "").strip() or None,
+                    "chat_id": (origin_raw.get("chat_id") or "").strip() or None,
+                    "thread_id": (origin_raw.get("thread_id") or "").strip() or None,
+                    "user_id": (origin_raw.get("user_id") or "").strip() or None,
+                }
+                origin_clean = {k: v for k, v in origin_clean.items() if v is not None}
+                update_kwargs["origin"] = origin_clean if origin_clean else None
+
+        # Handle deliver update — validate if provided
+        if "deliver" in args and args["deliver"] is not None:
+            deliver_val = str(args["deliver"]).strip()
+            err = _validate_deliver(deliver_val)
+            if err:
+                return json.dumps({"error": err})
+            update_kwargs["deliver"] = deliver_val
 
         result = db.update_workflow(workflow_id, **update_kwargs)
 
@@ -415,11 +573,25 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
 
     try:
         db = get_db()
-        # Extract origin from kwargs (set by executor/__init__)
+        # Extract origin from kwargs (set by executor/__init__).
+        # Fall back to the executor's active-origin registry if kwargs are empty.
         origin_platform = (kwargs.get("origin_platform") or "").strip() or None
         origin_chat_id = (kwargs.get("origin_chat_id") or "").strip() or None
         origin_thread_id = (kwargs.get("origin_thread_id") or "").strip() or None
         origin_user_id = (kwargs.get("origin_user_id") or "").strip() or None
+
+        # Fallback: read from executor._active_origins if kwargs are empty
+        if not origin_platform and not origin_chat_id:
+            try:
+                from .executor import get_active_origin
+                active = get_active_origin(current_wf)
+                if active:
+                    origin_platform = active.get("origin_platform") or None
+                    origin_chat_id = active.get("origin_chat_id") or None
+                    origin_thread_id = active.get("origin_thread_id") or None
+                    origin_user_id = active.get("origin_user_id") or None
+            except ImportError:
+                pass
 
         action = db.create_pending_action(
             workflow_id=current_wf,
@@ -535,6 +707,188 @@ def _handle_list_pending(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 12. workflow_send_message
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
+    message = (args.get("message") or "").strip()
+
+    if not message:
+        return json.dumps({"error": "message is required"})
+
+    current_wf = _get_current_workflow_id(kwargs)
+    if not current_wf:
+        return json.dumps({
+            "error": "No workflow context available. workflow_send_message can only be called during a workflow run."
+        })
+
+    try:
+        db = get_db()
+        wf = db.get_workflow(current_wf)
+        if wf is None:
+            return json.dumps({"error": f"Workflow '{current_wf}' not found."})
+
+        # Every workflow has an origin
+        origin = wf.get("origin") or {}
+        deliver = (wf.get("deliver") or "").strip()
+
+        if not deliver:
+            return json.dumps({
+                "success": False,
+                "message": "Workflow has no deliver target set. Use workflow_update to set one.",
+            })
+
+        # Resolve delivery target: which platform + chat_id to use
+        target_platform: Optional[str] = None
+        target_chat_id: Optional[str] = None
+
+        if deliver == "local":
+            return json.dumps({
+                "success": True,
+                "message": "Message recorded (deliver=local — no gateway delivery).",
+            })
+
+        if deliver == "origin":
+            # Send to the platform/chat where this workflow was created
+            target_platform = (origin.get("platform") or "").strip() or None
+            target_chat_id = (origin.get("chat_id") or "").strip() or None
+        else:
+            # deliver is a specific platform name like "discord", "telegram"
+            target_platform = deliver
+            target_chat_id = (origin.get("chat_id") or "").strip() or None
+
+        if not target_platform:
+            return json.dumps({
+                "success": False,
+                "message": f"Cannot deliver message: no target platform resolved (deliver={deliver}).",
+            })
+
+        if not target_chat_id:
+            return json.dumps({
+                "success": False,
+                "message": (
+                    f"Cannot deliver message to '{target_platform}': "
+                    f"no chat_id in origin. Set origin.chat_id via "
+                    f"workflow_update or the dashboard."
+                ),
+            })
+
+        # Use the gateway reference to send the message
+        try:
+            from .scheduler import _gateway_ref
+            gateway = _gateway_ref
+        except ImportError:
+            return json.dumps({"error": "Gateway reference not available — message delivery is only supported at runtime."})
+
+        if gateway is None:
+            return json.dumps({
+                "success": False,
+                "message": "Gateway reference not yet available. Try again later or use workflow_wait_for_user to interact.",
+            })
+
+        # Find matching adapter
+        adapters = getattr(gateway, "adapters", {}) or {}
+        sent = False
+        for plat, adapter in adapters.items():
+            plat_str = plat.value if hasattr(plat, "value") else str(plat)
+            if plat_str.lower() == target_platform.lower():
+                import asyncio
+                loop = getattr(gateway, "loop", None)
+                if loop and loop.is_running():
+                    async def _send():
+                        try:
+                            await adapter.send(target_chat_id, message)
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_send(), loop)
+                    sent = True
+                break
+
+        if sent:
+            return json.dumps({
+                "success": True,
+                "message": f"Message delivered to {target_platform} chat {target_chat_id}.",
+            })
+        else:
+            return json.dumps({
+                "success": False,
+                "message": f"No adapter found for platform '{target_platform}'.",
+            })
+
+    except Exception as e:
+        logger.exception("Failed to send message from workflow '%s'", current_wf)
+        return json.dumps({"error": f"Failed to send message: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13. workflow_disable
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_disable(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+
+    try:
+        db = get_db()
+        result = db.update_workflow(workflow_id, enabled=False)
+
+        if result is None:
+            return json.dumps({
+                "success": False,
+                "message": f"Workflow '{workflow_id}' not found.",
+            })
+
+        # Remove from scheduler so it stops firing
+        schedule_workflow(result)
+
+        return json.dumps({
+            "success": True,
+            "workflow_id": workflow_id,
+            "enabled": False,
+            "message": f"Workflow '{workflow_id}' disabled/paused. It will not run again until re-enabled.",
+        })
+    except Exception as e:
+        logger.exception("Failed to disable workflow '%s'", workflow_id)
+        return json.dumps({"error": f"Failed to disable workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14. workflow_enable
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _handle_enable(args: Dict[str, Any], **kwargs: Any) -> str:
+    workflow_id = (args.get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        return json.dumps({"error": "workflow_id is required"})
+
+    try:
+        db = get_db()
+        result = db.update_workflow(workflow_id, enabled=True)
+
+        if result is None:
+            return json.dumps({
+                "success": False,
+                "message": f"Workflow '{workflow_id}' not found.",
+            })
+
+        # Re-add to scheduler so it resumes firing
+        schedule_workflow(result)
+
+        return json.dumps({
+            "success": True,
+            "workflow_id": workflow_id,
+            "enabled": True,
+            "message": f"Workflow '{workflow_id}' re-enabled. It will resume running on its schedule.",
+        })
+    except Exception as e:
+        logger.exception("Failed to enable workflow '%s'", workflow_id)
+        return json.dumps({"error": f"Failed to enable workflow: {e}"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Handler map — used by __init__.py to wire schemas to implementations
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -550,4 +904,7 @@ HANDLER_MAP = {
     "workflow_wait_for_user": _handle_wait_for_user,
     "workflow_submit_response": _handle_submit_response,
     "workflow_list_pending": _handle_list_pending,
+    "workflow_send_message": _handle_send_message,
+    "workflow_disable": _handle_disable,
+    "workflow_enable": _handle_enable,
 }

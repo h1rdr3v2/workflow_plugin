@@ -23,6 +23,9 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from db import get_db  # noqa: E402
 from scheduler import schedule_workflow, unschedule_workflow, get_jobs_status  # noqa: E402
 
+# Import deliver validation from the parent plugin
+from tools import _validate_deliver, VALID_DELIVER_VALUES  # noqa: E402
+
 from fastapi import APIRouter, Request
 
 router = APIRouter()
@@ -53,6 +56,9 @@ def list_workflows() -> dict:
             "cron_expression": wf["cron_expression"],
             "prompt": wf.get("prompt", ""),
             "enabled": bool(wf["enabled"]),
+            "origin": wf.get("origin"),
+            "deliver": wf.get("deliver", "local"),
+            "trigger_type": wf.get("trigger_type", "cron"),
             "created_at": wf["created_at"],
             "updated_at": wf["updated_at"],
             "next_run": job_info.get("next_run"),
@@ -93,6 +99,9 @@ def get_workflow(workflow_id: str) -> dict:
             "cron_expression": wf["cron_expression"],
             "prompt": wf["prompt"],
             "enabled": bool(wf["enabled"]),
+            "origin": wf.get("origin"),
+            "deliver": wf.get("deliver", "local"),
+            "trigger_type": wf.get("trigger_type", "cron"),
             "created_at": wf["created_at"],
             "updated_at": wf["updated_at"],
             "next_run": job_info.get("next_run"),
@@ -135,6 +144,10 @@ async def create_workflow(request: Request) -> dict:
     cron_expression = (body.get("cron_expression") or "").strip()
     prompt = (body.get("prompt") or "").strip()
     description = (body.get("description") or "").strip()
+    origin = body.get("origin")  # optional dict
+    deliver = (body.get("deliver") or "").strip()
+    trigger_at = (body.get("trigger_at") or "").strip() or None
+    trigger_in = (body.get("trigger_in") or "").strip() or None
 
     # Validate
     errors = []
@@ -142,19 +155,35 @@ async def create_workflow(request: Request) -> dict:
         errors.append("id is required")
     if not name:
         errors.append("name is required")
-    if not cron_expression:
-        errors.append("cron_expression is required")
     if not prompt:
         errors.append("prompt is required")
 
-    if len(cron_expression.split()) != 5:
-        errors.append("cron_expression must have exactly 5 fields")
+    # Validate deliver (required for dashboard, no default)
+    err = _validate_deliver(deliver)
+    if err:
+        errors.append(err)
 
-    # Real cron validation
-    if not errors:
+    # Determine trigger type
+    trigger_type = "cron"
+    if trigger_at or trigger_in:
+        trigger_type = "oneshot"
+        # Compute cron expression for the one-shot
+        from tools import _compute_oneshot_cron  # noqa: E402
+        effective_cron = _compute_oneshot_cron(trigger_at, trigger_in)
+        if effective_cron is None:
+            errors.append("trigger_at must be a valid ISO 8601 timestamp, or trigger_in must be a duration like '5m', '1h', '30s'")
+    else:
+        effective_cron = cron_expression
+        if not cron_expression:
+            errors.append("cron_expression is required when trigger_at and trigger_in are not provided")
+        elif len(cron_expression.split()) != 5:
+            errors.append("cron_expression must have exactly 5 fields")
+
+    # Real cron validation (only for cron-type workflows)
+    if not errors and trigger_type == "cron":
         try:
             from apscheduler.triggers.cron import CronTrigger
-            CronTrigger.from_crontab(cron_expression)
+            CronTrigger.from_crontab(effective_cron)
         except (ValueError, KeyError) as e:
             errors.append(f"Invalid cron expression: {e}")
         except ImportError:
@@ -165,7 +194,12 @@ async def create_workflow(request: Request) -> dict:
 
     try:
         db = get_db()
-        wf = db.create_workflow(workflow_id, name, cron_expression, prompt, description)
+        wf = db.create_workflow(
+            workflow_id, name, effective_cron, prompt, description,
+            origin=origin if isinstance(origin, dict) else None,
+            trigger_type=trigger_type,
+            deliver=deliver,
+        )
         schedule_workflow(wf)
 
         return {
@@ -203,6 +237,21 @@ async def update_workflow(workflow_id: str, request: Request) -> dict:
 
     if "enabled" in body and body["enabled"] is not None:
         update_kwargs["enabled"] = bool(body["enabled"])
+
+    if "origin" in body and body["origin"] is not None:
+        origin = body["origin"]
+        if isinstance(origin, dict):
+            update_kwargs["origin"] = origin
+
+    if "deliver" in body and body["deliver"] is not None:
+        deliver_val = str(body["deliver"]).strip()
+        err = _validate_deliver(deliver_val)
+        if err:
+            return {"error": err}
+        update_kwargs["deliver"] = deliver_val
+
+    if "trigger_type" in body and body["trigger_type"] is not None:
+        update_kwargs["trigger_type"] = str(body["trigger_type"]).strip()
 
     try:
         db = get_db()
