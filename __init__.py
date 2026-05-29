@@ -471,7 +471,7 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     try:
         hermes_bin = shutil.which("hermes") or "hermes"
         result = subprocess.run(
-            [hermes_bin, "-z", "-t", "workflow_engine", full_prompt],
+            [hermes_bin, "-z", full_prompt, "-t", "workflow_engine"],
             capture_output=True, text=True, timeout=300,
         )
 
