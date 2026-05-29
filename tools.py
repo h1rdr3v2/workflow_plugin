@@ -16,10 +16,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
-from .db import get_db
-from .scheduler import schedule_workflow, unschedule_workflow
+try:
+    from .db import get_db
+    from .scheduler import schedule_workflow, unschedule_workflow
+except ImportError:
+    from db import get_db  # noqa: E402
+    from scheduler import schedule_workflow, unschedule_workflow  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +47,18 @@ def _validate_deliver(deliver_value: str) -> str | None:
 def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
     """
     Extract the workflow_id from the execution context.
-    
-    In a workflow run, kwargs includes the workflow_id of the currently
-    executing workflow. For tools called outside a workflow run (e.g.,
-    create, list), this returns None.
+
+    Checks (in order):
+    1. ``kwargs["workflow_id"]`` — set by Hermes session metadata
+    2. ``HERMES_WORKFLOW_ID`` env var — set by the workflow subprocess launcher
+
+    For tools called outside a workflow run (e.g. create, list), returns None.
     """
-    return (kwargs.get("workflow_id") or "").strip() or None
+    from_kwargs = (kwargs.get("workflow_id") or "").strip()
+    if from_kwargs:
+        return from_kwargs
+    env_id = os.environ.get("HERMES_WORKFLOW_ID", "").strip()
+    return env_id or None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -257,7 +257,10 @@ def _run_timeout_checker() -> None:
     _last_timeout_check = now
 
     try:
-        from .db import get_db
+        try:
+            from .db import get_db
+        except ImportError:
+            from db import get_db  # noqa: E402
         db = get_db()
         expired = db.get_expired_actions()
 
@@ -308,7 +311,10 @@ def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
 def _auto_disable_oneshot(workflow_id: str) -> None:
     """If a workflow is a one-shot, disable it after it fires."""
     try:
-        from .db import get_db
+        try:
+            from .db import get_db
+        except ImportError:
+            from db import get_db  # noqa: E402
         db = get_db()
         wf = db.get_workflow(workflow_id)
         if wf and wf.get("trigger_type") == "oneshot" and wf.get("enabled"):

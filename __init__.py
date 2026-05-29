@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -470,9 +471,12 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
 
     try:
         hermes_bin = shutil.which("hermes") or "hermes"
+        env = os.environ.copy()
+        env["HERMES_WORKFLOW_ID"] = workflow_id
         result = subprocess.run(
             [hermes_bin, "-z", full_prompt, "-t", "workflow_engine"],
             capture_output=True, text=True, timeout=300,
+            env=env,
         )
 
         output = (result.stdout or "").strip()

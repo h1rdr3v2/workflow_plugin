@@ -16,7 +16,10 @@ import logging
 import time
 from typing import Any, Callable, Dict, Optional
 
-from .db import get_db
+try:
+    from .db import get_db
+except ImportError:
+    from db import get_db  # noqa: E402 — standalone import (dashboard, tests)
 
 logger = logging.getLogger(__name__)
 
