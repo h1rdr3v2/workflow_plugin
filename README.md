@@ -5,7 +5,7 @@ A first-class **workflow engine** that lets users and agents create scheduled cr
 ## What It Does
 
 - **Create workflows** — define a named job with a cron schedule and agent prompt, via chat or dashboard
-- **Built-in scheduler** — APScheduler manages all cron triggers, no reliance on Hermes cron
+- **Built-in scheduler** — croniter-based polling loop manages all cron triggers, no reliance on Hermes cron
 - **Persistent state** — each workflow has its own namespaced key-value store that survives across runs
 - **Human-in-the-loop** — agents can pause mid-run and ask a human for input; the response is injected on the next tick
 - **Dashboard** — full UI for creating, editing, enabling/disabling, and monitoring workflows
@@ -41,7 +41,7 @@ Agent: [calls workflow_create with appropriate params]
 ├── __init__.py              # register(ctx) — wires tools, hooks, scheduler, skill
 ├── models.py                # Workflow, WorkflowRun, PendingAction dataclasses
 ├── db.py                    # SQLite layer (workflow_engine.db) — 3 tables
-├── scheduler.py             # APScheduler cron loop
+├── scheduler.py             # croniter-based polling scheduler
 ├── executor.py              # Runs a single workflow tick
 ├── schemas.py               # 11 LLM-visible tool definitions
 ├── tools.py                 # 11 tool handler implementations
@@ -77,7 +77,7 @@ Agent: [calls workflow_create with appropriate params]
 | Hook              | Purpose                                                                                         |
 | ----------------- | ----------------------------------------------------------------------------------------------- |
 | `pre_llm_call`    | Injects workflow state + pending/resolved responses into agent context at the start of each run |
-| `plugin_shutdown` | Gracefully stops the APScheduler                                                                |
+| `plugin_shutdown` | Gracefully stops the scheduler                                                                  |
 
 ## Human Interface
 
@@ -115,12 +115,12 @@ All state is scoped by `workflow_id` — each workflow has its own logical names
 
 - Hermes Agent (plugin-capable version)
 - Python 3.10+
-- `apscheduler` (`pip install apscheduler`)
+- `croniter` (core Hermes dependency, always available)
 - `sqlite3` (bundled with Python)
 
 ## Design Decisions
 
-- **Built-in scheduler** via APScheduler — workflows don't depend on Hermes cron jobs
+- **Built-in scheduler** via croniter — workflows don't depend on Hermes cron jobs
 - **Single SQLite DB** with per-workflow namespacing — simple, portable, no external dependencies
 - **Overlap protection** — a workflow with an unresolved pending action won't trigger again until resolved
 - **Thread-safe** — same BEGIN IMMEDIATE + jitter retry pattern as Hermes's own SessionDB

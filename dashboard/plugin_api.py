@@ -23,8 +23,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from db import get_db  # noqa: E402
 from scheduler import schedule_workflow, unschedule_workflow, get_jobs_status  # noqa: E402
 
-# Import deliver validation and lazy deps from the parent plugin
-from lazy_deps import ensure as _ensure_dep, FeatureUnavailable  # noqa: E402
+# Import deliver validation from the parent plugin
 from tools import _validate_deliver, VALID_DELIVER_VALUES  # noqa: E402
 
 from fastapi import APIRouter, Request
@@ -183,13 +182,10 @@ async def create_workflow(request: Request) -> dict:
     # Real cron validation (only for cron-type workflows)
     if not errors and trigger_type == "cron":
         try:
-            _ensure_dep("apscheduler")
-            from apscheduler.triggers.cron import CronTrigger
-            CronTrigger.from_crontab(effective_cron)
+            from croniter import croniter
+            croniter(effective_cron)
         except (ValueError, KeyError) as e:
             errors.append(f"Invalid cron expression: {e}")
-        except FeatureUnavailable:
-            pass
 
     if errors:
         return {"error": "; ".join(errors)}
@@ -229,13 +225,10 @@ async def update_workflow(workflow_id: str, request: Request) -> dict:
                 if len(val.split()) != 5:
                     return {"error": "cron_expression must have exactly 5 fields"}
                 try:
-                    _ensure_dep("apscheduler")
-                    from apscheduler.triggers.cron import CronTrigger
-                    CronTrigger.from_crontab(val)
+                    from croniter import croniter
+                    croniter(val)
                 except (ValueError, KeyError) as e:
                     return {"error": f"Invalid cron expression: {e}"}
-                except FeatureUnavailable:
-                    pass
             update_kwargs[field] = val
 
     if "enabled" in body and body["enabled"] is not None:

@@ -5,22 +5,19 @@ Lightweight importability checks for optional dependencies.  Raises
 :class:`FeatureUnavailable` with a helpful install hint when a
 required package is missing.
 
-This is a **third-party plugin** — it does NOT go through Hermes'
-security-gated ``tools.lazy_deps`` (we can't edit the Hermes allowlist).
-Users should install optional deps themselves, e.g.:
+.. note::
 
-    pip install workflow_plugin[apscheduler]
+    ``croniter`` is a core Hermes dependency (always installed) — no
+    lazy check needed.  Import it directly.
 
 Usage::
 
     from .lazy_deps import ensure, FeatureUnavailable
 
     try:
-        ensure("apscheduler")
+        ensure("some-optional-dep")
     except FeatureUnavailable as exc:
         return {"error": str(exc)}
-
-    from apscheduler.triggers.cron import CronTrigger  # safe now
 """
 
 from __future__ import annotations
@@ -49,7 +46,8 @@ class FeatureUnavailable(RuntimeError):
 # Maps feature keys to the top-level module(s) that must be importable.
 # Package names are derived from module names (same convention as pip).
 _REGISTRY: dict[str, tuple[str, ...]] = {
-    "apscheduler": ("apscheduler",),
+    # Add optional plugin dependencies here as needed.
+    # croniter is a core Hermes dep — no entry needed.
 }
 
 

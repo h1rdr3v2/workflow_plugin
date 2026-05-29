@@ -19,7 +19,6 @@ import logging
 from typing import Any, Dict, Optional
 
 from .db import get_db
-from .lazy_deps import ensure as _ensure_dep, FeatureUnavailable
 from .scheduler import schedule_workflow, unschedule_workflow
 
 logger = logging.getLogger(__name__)
@@ -123,15 +122,12 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
             })
 
         try:
-            _ensure_dep("apscheduler")
-            from apscheduler.triggers.cron import CronTrigger
-            CronTrigger.from_crontab(effective_cron)
+            from croniter import croniter
+            croniter(effective_cron)
         except (ValueError, KeyError) as e:
             return json.dumps({
                 "error": f"Invalid cron expression '{effective_cron}': {e}"
             })
-        except FeatureUnavailable:
-            pass  # APScheduler not installed — skip deep validation
 
     try:
         db = get_db()
@@ -254,13 +250,10 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
                     if len(parts) != 5:
                         return json.dumps({"error": f"cron_expression must have exactly 5 fields, got {len(parts)}"})
                     try:
-                        _ensure_dep("apscheduler")
-                        from apscheduler.triggers.cron import CronTrigger
-                        CronTrigger.from_crontab(val)
+                        from croniter import croniter
+                        croniter(val)
                     except (ValueError, KeyError) as e:
                         return json.dumps({"error": f"Invalid cron expression '{val}': {e}"})
-                    except FeatureUnavailable:
-                        pass
                 update_kwargs[field] = val
 
         if "enabled" in args and args["enabled"] is not None:

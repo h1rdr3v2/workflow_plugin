@@ -1,189 +1,172 @@
 """
 Workflow Engine — Scheduler.
 
-Manages the APScheduler-based cron loop that triggers workflow
-executions. Handles:
-- Loading all enabled workflows on startup and scheduling them
-- Adding/removing jobs when workflows are created/deleted/enabled/disabled
-- Preventing overlapping runs (won't start a new run if the previous
-  is still in "paused" state with an unresolved pending action)
-- Dispatching each tick to the executor
+Lightweight polling-based scheduler using ``croniter`` (Hermes core dep).
+Follows the same pattern as ``gateway/run.py:_start_cron_ticker``.
+
+Manages:
+- Cron-based recurring workflows (polled)
+- One-shot workflows (``threading.Timer``)
+- Timeout checker (every 30s in the poll loop)
+- Overlap protection (skips if a paused run exists)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Optional
-
-from .lazy_deps import ensure as _ensure_dep, FeatureUnavailable
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Lazy import apscheduler — degrade gracefully if not installed ─────────
+# ── croniter ──────────────────────────────────────────────────────────────
+# Core Hermes dependency — always available.  No lazy check needed.
 
-_apscheduler_missing: Optional[str] = None
-
-try:
-    _ensure_dep("apscheduler")
-    from apscheduler.schedulers.background import BackgroundScheduler  # noqa: F811
-    from apscheduler.triggers.cron import CronTrigger
-    from apscheduler.jobstores.base import JobLookupError
-
-    _HAS_APSCHEDULER = True
-except FeatureUnavailable as e:
-    _HAS_APSCHEDULER = False
-    _apscheduler_missing = str(e)
-    # Define stubs so the module can still be imported
-    BackgroundScheduler = None  # type: ignore[misc]
-    CronTrigger = None  # type: ignore[misc]
-    JobLookupError = Exception  # type: ignore[misc]
-
-# Reference to the executor — set at registration time
-_executor: Optional[Callable[[str], None]] = None
+from croniter import croniter  # type: ignore[import-untyped]
 
 
-def set_executor(fn: Callable[[str], None]) -> None:
+# ── Scheduler state ───────────────────────────────────────────────────────
+
+_executor: Optional[Callable[..., Any]] = None
+_gateway_ref: Any = None
+
+_workflows: Dict[str, Dict[str, Any]] = {}       # workflow_id → workflow dict
+_next_runs: Dict[str, float] = {}                  # workflow_id → next epoch
+_timers: Dict[str, threading.Timer] = {}           # workflow_id → one-shot timer
+_stop_event = threading.Event()
+_thread: Optional[threading.Thread] = None
+_lock = threading.Lock()
+
+# Minimum sleep between poll iterations to avoid busy-waiting
+_MIN_SLEEP = 0.5
+_MAX_SLEEP = 60.0
+
+
+def set_executor(fn: Callable[..., Any]) -> None:
     """Register the executor function the scheduler will call on each tick."""
     global _executor
     _executor = fn
 
 
-# ── Scheduler singleton ───────────────────────────────────────────────────
+# ── Gateway ref —──────────────────────────────────────────────────────────
 
-_scheduler: Optional[BackgroundScheduler] = None
-
-
-def get_scheduler() -> BackgroundScheduler:
-    """Get or create the BackgroundScheduler singleton."""
-    if not _HAS_APSCHEDULER:
-        raise RuntimeError(_apscheduler_missing)
-
-    global _scheduler
-    if _scheduler is not None:
-        return _scheduler
-
-    _scheduler = BackgroundScheduler(
-        job_defaults={
-            "coalesce": True,  # if a job is missed, run it once, not multiple times
-            "max_instances": 1,  # prevent concurrent executions of the same job
-            "misfire_grace_time": 300,  # 5 minutes grace for missed jobs
-        },
-    )
-    return _scheduler
-
-
-# ── Job ID helpers ────────────────────────────────────────────────────────
-
-
-def _job_id(workflow_id: str) -> str:
-    return f"workflow:{workflow_id}"
+def set_gateway_ref(gateway: Any) -> None:
+    """Store a reference to the GatewayRunner for message delivery."""
+    global _gateway_ref
+    _gateway_ref = gateway
 
 
 # ── Schedule / unschedule ─────────────────────────────────────────────────
 
+def _parse_cron_to_next(cron_expr: str, base_time: Optional[datetime] = None) -> float:
+    """Return the next run time (epoch seconds) for a cron expression."""
+    now = base_time or datetime.now(timezone.utc)
+    it = croniter(cron_expr, now)
+    return it.get_next(float)
+
 
 def schedule_workflow(workflow: Dict[str, Any]) -> None:
     """
-    Add or update a cron job for a given workflow.
-    The job will call the executor with the workflow_id.
+    Add or update a workflow in the poll schedule.
 
-    Supports both cron-based (recurring) and one-shot (DateTrigger) workflows.
-    One-shot workflows are auto-disabled after firing.
+    For cron workflows: computes next-run time and adds to the poll table.
+    For one-shot workflows: schedules a ``threading.Timer``.
+    Disabled workflows are removed from the schedule.
     """
-    if not _HAS_APSCHEDULER:
-        logger.warning("Cannot schedule workflow '%s': %s", workflow.get("id", "?"), _apscheduler_missing)
-        return
-    scheduler = get_scheduler()
-    jid = _job_id(workflow["id"])
+    wf_id: str = workflow["id"]
 
-    # Remove existing job for this workflow if present
-    try:
-        scheduler.remove_job(jid)
-    except JobLookupError:
-        pass
+    with _lock:
+        # Cancel any existing timer / remove from tables
+        _cancel_timer(wf_id)
+        _workflows.pop(wf_id, None)
+        _next_runs.pop(wf_id, None)
 
-    if not workflow.get("enabled", True):
-        logger.debug("Workflow %s is disabled — not scheduling", workflow["id"])
-        return
-
-    trigger_type = workflow.get("trigger_type", "cron")
-
-    if trigger_type == "oneshot":
-        # Use DateTrigger for one-shot workflows
-        try:
-            from apscheduler.triggers.date import DateTrigger
-            from datetime import datetime, timezone
-
-            # Parse the cron expression back to a datetime
-            # The cron was generated as "minute hour day month *"
-            parts = workflow["cron_expression"].split()
-            if len(parts) == 5:
-                run_time = datetime(
-                    year=datetime.now(timezone.utc).year,
-                    month=int(parts[3]),
-                    day=int(parts[2]),
-                    hour=int(parts[1]),
-                    minute=int(parts[0]),
-                )
-            else:
-                logger.error("Invalid one-shot cron for %s: %s", workflow["id"], workflow["cron_expression"])
-                return
-
-            # If the computed time is in the past, it'll fire immediately
-            trigger = DateTrigger(run_date=run_time)
-        except ImportError:
-            logger.warning("DateTrigger not available, falling back to cron for '%s'", workflow["id"])
-            try:
-                trigger = CronTrigger.from_crontab(workflow["cron_expression"])
-            except (ValueError, KeyError) as e:
-                logger.error("Invalid cron for '%s': %s — %s", workflow["id"], workflow["cron_expression"], e)
-                return
-        except Exception as e:
-            logger.error("Failed to create DateTrigger for '%s': %s", workflow["id"], e)
+        if not workflow.get("enabled", True):
+            logger.debug("Workflow %s is disabled — not scheduling", wf_id)
             return
-    else:
+
+        trigger_type = workflow.get("trigger_type", "cron")
+        cron_expr = workflow.get("cron_expression", "")
+
+        if trigger_type == "oneshot":
+            _schedule_oneshot(wf_id, cron_expr)
+            return
+
+        # Recurring cron workflow
         try:
-            trigger = CronTrigger.from_crontab(workflow["cron_expression"])
+            next_ts = _parse_cron_to_next(cron_expr)
         except (ValueError, KeyError) as e:
-            logger.error(
-                "Invalid cron expression for workflow %s: %s — %s",
-                workflow["id"],
-                workflow["cron_expression"],
-                e,
-            )
+            logger.error("Invalid cron for '%s': %s — %s", wf_id, cron_expr, e)
             return
 
-    scheduler.add_job(
-        _tick,
-        trigger=trigger,
-        id=jid,
-        args=[workflow["id"]],
-        name=f"Workflow: {workflow['name']}",
-        replace_existing=True,
-    )
-
-    # Compute next run time for logging
-    job = scheduler.get_job(jid)
-    next_run = job.next_run_time.isoformat() if job and job.next_run_time else "unknown"
+        _workflows[wf_id] = workflow
+        _next_runs[wf_id] = next_ts
 
     logger.info(
         "Scheduled workflow '%s' (%s): type=%s cron='%s' next_run=%s",
-        workflow["name"],
-        workflow["id"],
+        workflow.get("name", "?"),
+        wf_id,
         trigger_type,
-        workflow["cron_expression"],
-        next_run,
+        cron_expr,
+        datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat()
+        if trigger_type == "cron" else "now",
     )
 
 
-def unschedule_workflow(workflow_id: str) -> None:
-    """Remove a workflow's cron job from the scheduler."""
-    scheduler = get_scheduler()
+def _schedule_oneshot(wf_id: str, cron_expr: str) -> None:
+    """Schedule a one-shot workflow via threading.Timer."""
     try:
-        scheduler.remove_job(_job_id(workflow_id))
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            logger.error("Invalid one-shot cron for %s: %s", wf_id, cron_expr)
+            return
+
+        now = datetime.now(timezone.utc)
+        run_time = datetime(
+            year=now.year,
+            month=int(parts[3]),
+            day=int(parts[2]),
+            hour=int(parts[1]),
+            minute=int(parts[0]),
+            tzinfo=timezone.utc,
+        )
+
+        delay = (run_time - now).total_seconds()
+        if delay <= 0:
+            # Already past due — fire immediately (but in a thread to avoid blocking)
+            logger.info("One-shot '%s' is past due — firing now", wf_id)
+            threading.Thread(target=_fire, args=(wf_id,), daemon=True).start()
+        else:
+            timer = threading.Timer(delay, _fire, args=[wf_id])
+            timer.daemon = True
+            timer.start()
+            _timers[wf_id] = timer
+            logger.info(
+                "One-shot '%s' scheduled in %.0fs (at %s)",
+                wf_id,
+                delay,
+                run_time.isoformat(),
+            )
+    except Exception:
+        logger.exception("Failed to schedule one-shot '%s'", wf_id)
+
+
+def _cancel_timer(wf_id: str) -> None:
+    """Cancel and remove a one-shot timer if present."""
+    timer = _timers.pop(wf_id, None)
+    if timer is not None:
+        timer.cancel()
+
+
+def unschedule_workflow(workflow_id: str) -> None:
+    """Remove a workflow from the schedule."""
+    with _lock:
+        _cancel_timer(workflow_id)
+        existed = _workflows.pop(workflow_id, None) is not None or _next_runs.pop(workflow_id, None) is not None
+    if existed:
         logger.info("Unscheduled workflow: %s", workflow_id)
-    except JobLookupError:
-        pass
 
 
 def schedule_all_workflows(workflows: list) -> None:
@@ -193,21 +176,58 @@ def schedule_all_workflows(workflows: list) -> None:
     logger.info("Scheduled %d workflows", len(workflows))
 
 
-# ── Tick — called by APScheduler when a cron trigger fires ─────────────────
+# ── Polling loop —─────────────────────────────────────────────────────────
+
+def _poll_loop() -> None:
+    """Main polling loop.  Checks for due workflows, fires them, handles timeouts."""
+    logger.info("Workflow poll loop started")
+
+    while not _stop_event.is_set():
+        loop_start = time.time()
+
+        # ── Fire due workflows ────────────────────────────────────────
+        with _lock:
+            now = time.time()
+            due_ids = [wid for wid, ts in _next_runs.items() if ts <= now]
+
+        for wid in due_ids:
+            _fire(wid)
+
+        # ── Recompute next runs for fired workflows ───────────────────
+        with _lock:
+            for wid in due_ids:
+                wf = _workflows.get(wid)
+                if wf and wf.get("enabled") and wf.get("trigger_type", "cron") == "cron":
+                    try:
+                        _next_runs[wid] = _parse_cron_to_next(wf["cron_expression"])
+                    except Exception:
+                        logger.exception("Failed to recompute next run for '%s' — removing", wid)
+                        _workflows.pop(wid, None)
+                        _next_runs.pop(wid, None)
+
+        # ── Timeout checker (every 30s) ───────────────────────────────
+        _run_timeout_checker()
+
+        # ── Compute sleep duration ────────────────────────────────────
+        with _lock:
+            run_times = list(_next_runs.values())
+            if run_times:
+                next_due = min(run_times)
+                sleep_for = max(_MIN_SLEEP, min(next_due - time.time(), _MAX_SLEEP))
+            else:
+                sleep_for = _MAX_SLEEP
+
+        elapsed = time.time() - loop_start
+        actual_sleep = max(0, sleep_for - elapsed)
+        _stop_event.wait(actual_sleep)
+
+    logger.info("Workflow poll loop stopped")
 
 
-def _tick(workflow_id: str) -> None:
-    """
-    Called by APScheduler when a workflow's cron trigger fires.
-
-    Dispatches to the executor. If no executor is registered, logs
-    a warning and skips.  After execution, auto-disables one-shot workflows.
-    """
+def _fire(workflow_id: str) -> None:
+    """Execute one tick of a workflow via the registered executor."""
     if _executor is None:
-        logger.warning(
-            "Scheduler tick for workflow '%s' but no executor registered — skipping",
-            workflow_id,
-        )
+        logger.warning("No executor registered — skipping tick for '%s'", workflow_id)
         return
 
     logger.info("Workflow tick: %s", workflow_id)
@@ -222,84 +242,20 @@ def _tick(workflow_id: str) -> None:
         logger.exception("Unhandled error in executor for workflow '%s'", workflow_id)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Timeout checker & immediate trigger — human-in-the-loop support
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Timeout checker ───────────────────────────────────────────────────────
 
-# Reference to the gateway runner — set via set_gateway_ref() so the
-# pre_gateway_dispatch hook and timeout checker can access platform adapters.
-_gateway_ref: Any = None
+_last_timeout_check: float = 0.0
+_TIMEOUT_INTERVAL = 30  # seconds
 
 
-def set_gateway_ref(gateway: Any) -> None:
-    """Store a reference to the GatewayRunner for message delivery."""
-    global _gateway_ref
-    _gateway_ref = gateway
+def _run_timeout_checker() -> None:
+    """Check for expired pending actions every 30 seconds."""
+    global _last_timeout_check
+    now = time.time()
+    if now - _last_timeout_check < _TIMEOUT_INTERVAL:
+        return
+    _last_timeout_check = now
 
-
-def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Trigger a workflow execution immediately, bypassing the cron schedule.
-
-    Called when a human responds to a pending action — we don't want to
-    wait for the next cron tick. The overlap protection still applies:
-    if a run is already active (another pending action unresolved), skip.
-
-    Returns the run_info dict from executor.execute(), or None on failure.
-    Auto-disables one-shot workflows after execution.
-    """
-    if _executor is None:
-        logger.warning(
-            "trigger_workflow_now for '%s' but no executor registered",
-            workflow_id,
-        )
-        return None
-
-    logger.info("Immediate trigger: %s", workflow_id)
-    try:
-        run_info = _executor(workflow_id)
-
-        # Auto-disable one-shot workflows after they fire
-        if isinstance(run_info, dict):
-            _auto_disable_oneshot(workflow_id)
-
-        return run_info
-    except Exception:
-        logger.exception(
-            "Unhandled error in immediate trigger for workflow '%s'",
-            workflow_id,
-        )
-        return None
-
-
-def _auto_disable_oneshot(workflow_id: str) -> None:
-    """
-    If a workflow is a one-shot, disable it after it fires so it doesn't
-    repeat on the equivalent cron.
-    """
-    try:
-        from .db import get_db
-        db = get_db()
-        wf = db.get_workflow(workflow_id)
-        if wf and wf.get("trigger_type") == "oneshot" and wf.get("enabled"):
-            logger.info("Auto-disabling one-shot workflow: %s", workflow_id)
-            updated = db.update_workflow(workflow_id, enabled=False)
-            if updated is not None:
-                unschedule_workflow(workflow_id)
-    except Exception:
-        logger.exception(
-            "Failed to auto-disable one-shot workflow '%s'",
-            workflow_id,
-        )
-
-
-def _timeout_checker() -> None:
-    """
-    Periodically check for expired pending actions and auto-dismiss them.
-
-    When an action expires, the associated workflow is triggered immediately
-    so the agent can continue without the human's input.
-    """
     try:
         from .db import get_db
         db = get_db()
@@ -321,67 +277,91 @@ def _timeout_checker() -> None:
         logger.exception("Timeout checker failed")
 
 
-def shutdown() -> None:
-    """Gracefully shut down the scheduler. Called by plugin_shutdown hook."""
-    if _scheduler is not None and getattr(_scheduler, "running", False):
-        _scheduler.shutdown(wait=False)
-        logger.info("Workflow scheduler shut down")
+# ── Immediate trigger —────────────────────────────────────────────────────
+
+def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Trigger a workflow execution immediately, bypassing the cron schedule.
+
+    Called when a human responds to a pending action.  Overlap protection
+    still applies: if a run is already active (paused), skip.
+
+    Returns the run_info dict from executor.execute(), or None on failure.
+    """
+    if _executor is None:
+        logger.warning("trigger_workflow_now for '%s' but no executor registered", workflow_id)
+        return None
+
+    logger.info("Immediate trigger: %s", workflow_id)
+    try:
+        run_info = _executor(workflow_id)
+
+        if isinstance(run_info, dict):
+            _auto_disable_oneshot(workflow_id)
+
+        return run_info
+    except Exception:
+        logger.exception("Unhandled error in immediate trigger for workflow '%s'", workflow_id)
+        return None
 
 
-# ── Scheduler lifecycle ───────────────────────────────────────────────────
+def _auto_disable_oneshot(workflow_id: str) -> None:
+    """If a workflow is a one-shot, disable it after it fires."""
+    try:
+        from .db import get_db
+        db = get_db()
+        wf = db.get_workflow(workflow_id)
+        if wf and wf.get("trigger_type") == "oneshot" and wf.get("enabled"):
+            logger.info("Auto-disabling one-shot workflow: %s", workflow_id)
+            updated = db.update_workflow(workflow_id, enabled=False)
+            if updated is not None:
+                unschedule_workflow(workflow_id)
+    except Exception:
+        logger.exception("Failed to auto-disable one-shot workflow '%s'", workflow_id)
 
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────
 
 def start(workflows: list) -> None:
-    """
-    Start the scheduler and schedule all enabled workflows.
-    Call once during plugin registration.
-    """
-    if not _HAS_APSCHEDULER:
-        logger.warning(
-            "Workflow scheduler NOT started: %s",
-            _apscheduler_missing,
-        )
+    """Start the poll loop daemon thread and schedule all enabled workflows."""
+    global _thread
+    if _thread is not None and _thread.is_alive():
+        logger.warning("Scheduler already running")
         return
-    sched = get_scheduler()
-    if not sched.running:
-        sched.start()
-        logger.info("Workflow scheduler started")
+
+    _stop_event.clear()
+    _thread = threading.Thread(target=_poll_loop, daemon=True, name="workflow-scheduler")
+    _thread.start()
     schedule_all_workflows(workflows)
-
-    # Add the timeout checker — runs every 30 seconds
-    try:
-        from apscheduler.triggers.interval import IntervalTrigger
-        sched.add_job(
-            _timeout_checker,
-            trigger=IntervalTrigger(seconds=30),
-            id="workflow:__timeout_checker__",
-            name="Workflow timeout checker",
-            replace_existing=True,
-        )
-        logger.info("Timeout checker scheduled (every 30s)")
-    except Exception:
-        logger.warning("Could not schedule timeout checker", exc_info=True)
+    logger.info("Workflow scheduler started (poll loop + %d workflows)", len(workflows))
 
 
-def shutdown(wait: bool = True) -> None:
-    """Shut down the scheduler. Call on plugin teardown."""
-    global _scheduler
-    if _scheduler and _scheduler.running:
-        _scheduler.shutdown(wait=wait)
-        _scheduler = None
-        logger.info("Workflow scheduler shut down")
+def shutdown() -> None:
+    """Gracefully stop the poll loop and cancel all one-shot timers."""
+    _stop_event.set()
+    with _lock:
+        for timer in _timers.values():
+            timer.cancel()
+        _timers.clear()
+    logger.info("Workflow scheduler shut down")
 
 
 def get_jobs_status() -> list:
-    """Return the status of all scheduled jobs for the dashboard."""
-    if not _HAS_APSCHEDULER:
-        return []
-    sched = get_scheduler()
-    jobs = []
-    for job in sched.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "name": job.name,
-            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
-        })
+    """Return a list of scheduled workflow info dicts for the dashboard API."""
+    jobs: list = []
+    with _lock:
+        now = time.time()
+        for wf_id, next_ts in _next_runs.items():
+            wf = _workflows.get(wf_id, {})
+            jobs.append({
+                "id": f"workflow:{wf_id}",
+                "name": wf.get("name", wf_id),
+                "next_run": datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat(),
+            })
+        for wf_id, timer in _timers.items():
+            jobs.append({
+                "id": f"workflow:{wf_id}",
+                "name": f"One-shot: {wf_id}",
+                "next_run": "pending (timer)",
+            })
     return jobs
