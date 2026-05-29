@@ -267,6 +267,12 @@ def _handle_pre_gateway_dispatch(
     If no matching pending action exists, returns None (normal dispatch).
     """
     try:
+        try:
+            from .scheduler import set_gateway_ref
+            set_gateway_ref(gateway)
+        except Exception:
+            pass
+
         source = getattr(event, "source", None)
         if source is None:
             return None
@@ -301,11 +307,6 @@ def _handle_pre_gateway_dispatch(
             platform_str,
             chat_id,
         )
-
-        # Store gateway reference for future use (e.g. sending confirmations
-        # and delivering workflow output via the scheduler)
-        from .scheduler import set_gateway_ref
-        set_gateway_ref(gateway)
 
         # Trigger the workflow immediately — don't wait for next cron tick.
         # Output delivery is handled by scheduler._deliver_workflow_output.
@@ -392,6 +393,10 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     run_id = kw.get("run_id", "")
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
+    origin_platform = kw.get("origin_platform", "")
+    origin_chat_id = kw.get("origin_chat_id", "")
+    origin_thread_id = kw.get("origin_thread_id", "")
+    origin_user_id = kw.get("origin_user_id", "")
 
     # ── Resolve model (same logic as cron/scheduler.py) ──────────────
     model = os.getenv("HERMES_MODEL", "")
@@ -429,25 +434,20 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     # Tell tool handlers which workflow this is
     tools.set_workflow_context(workflow_id, run_id)
 
-    # ── Session isolation (mirrors cron's approach) ───────────────────
-    # Clear HERMES_SESSION_* context vars so the workflow agent doesn't
-    # inherit a stale platform/chat_id from a previous gateway session.
-    # Without this, send_message could route to the wrong chat.
+    # Make configured MCP tools visible before AIAgent builds its tool list.
+    # Cron does this for the same reason: registry discovery is not guaranteed
+    # to have happened in this scheduler thread yet.
     try:
-        from gateway.session_context import set_session_vars, clear_session_vars
-        set_session_vars(platform="", chat_id="", chat_name="")
+        from tools.mcp_tool import discover_mcp_tools
+        discover_mcp_tools()
     except Exception:
-        pass
+        logger.debug("Workflow MCP tool discovery failed", exc_info=True)
 
-    # ── Resolve disabled toolsets (mirrors cron's _resolve_cron_disabled_toolsets) ──
-    # The workflow agent should have access to ALL hermes-agent tools
-    # (terminal, browser, curl, send_message, etc.) minus a few protected
-    # toolsets that are interactive-only or would let the agent self-modify:
-    #   - cronjob    — would let the agent schedule more cron/workflow jobs
-    #   - messaging  — interactive, needs a live gateway session
-    #   - clarify    — interactive, blocks waiting for user input
-    #   - delegation — would let the agent spawn sub-agents
-    disabled = ["cronjob", "delegation", "messaging", "clarify"]
+    # Workflows get Hermes' normal tool surface: terminal, browser,
+    # web/fetch, files, messaging, delegation, MCP tools, etc. Keep only
+    # tools that are structurally wrong for autonomous workflow execution
+    # disabled by default; operators can extend this via config.
+    disabled = ["cronjob", "clarify"]
     # Layer on user-level disabled_toolsets from config.yaml
     try:
         agent_cfg = _cfg.get("agent") or {}
@@ -456,17 +456,47 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
             name = str(name).strip()
             if name and name not in disabled:
                 disabled.append(name)
+        workflow_cfg = _cfg.get("workflow") or {}
+        workflow_disabled = workflow_cfg.get("disabled_toolsets") or []
+        for name in workflow_disabled:
+            name = str(name).strip()
+            if name and name not in disabled:
+                disabled.append(name)
     except Exception:
         pass
 
+    # Bind the workflow origin as the active session context. This lets
+    # Hermes tools such as send_message and background process notifications
+    # route back to the same chat/thread when the workflow has an origin.
+    session_tokens = None
+    try:
+        from gateway.session_context import set_session_vars
+        session_tokens = set_session_vars(
+            platform=str(origin_platform or ""),
+            chat_id=str(origin_chat_id or ""),
+            thread_id=str(origin_thread_id or ""),
+            user_id=str(origin_user_id or ""),
+            session_key=f"workflow:{workflow_id}",
+        )
+    except Exception:
+        session_tokens = None
+
     agent = AIAgent(
         model=model,
+        api_key=runtime.get("api_key"),
         provider=resolved_provider,
         base_url=base_url,
+        api_mode=runtime.get("api_mode"),
+        acp_command=runtime.get("command"),
+        acp_args=runtime.get("args"),
         enabled_toolsets=None,  # All default tools — mirrors cron behavior
         disabled_toolsets=disabled,
         quiet_mode=True,
-        platform="workflow",
+        platform=origin_platform or "workflow",
+        chat_id=str(origin_chat_id or "") or None,
+        thread_id=str(origin_thread_id or "") or None,
+        user_id=str(origin_user_id or "") or None,
+        gateway_session_key=f"workflow:{workflow_id}",
         session_id=f"wf_{workflow_id}_{run_id}",
         skip_memory=True,
         skip_context_files=True,
@@ -480,6 +510,12 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
         return {"summary": summary}
     finally:
         tools.clear_workflow_context()
+        if session_tokens is not None:
+            try:
+                from gateway.session_context import clear_session_vars
+                clear_session_vars(session_tokens)
+            except Exception:
+                pass
 
 
 # ── register() — plugin entry point ───────────────────────────────────────

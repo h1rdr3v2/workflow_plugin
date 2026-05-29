@@ -75,12 +75,50 @@ def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
     return _WF_CTX.get("workflow_id") or None
 
 
+def _get_current_run_id(kwargs: Dict[str, Any]) -> str | None:
+    """Extract the current run_id from kwargs or module context."""
+    from_kwargs = (kwargs.get("run_id") or "").strip()
+    if from_kwargs:
+        return from_kwargs
+    return _WF_CTX.get("run_id") or None
+
+
+def _clean_origin(origin_raw: Any) -> Optional[Dict[str, Any]]:
+    """Normalize an origin dict and remove empty values."""
+    if not isinstance(origin_raw, dict):
+        return None
+    origin = {
+        "platform": (origin_raw.get("platform") or "").strip() or None,
+        "chat_id": (origin_raw.get("chat_id") or "").strip() or None,
+        "thread_id": (origin_raw.get("thread_id") or "").strip() or None,
+        "user_id": (origin_raw.get("user_id") or "").strip() or None,
+    }
+    origin = {k: v for k, v in origin.items() if v is not None}
+    return origin or None
+
+
+def _origin_from_session_env() -> Optional[Dict[str, Any]]:
+    """Infer workflow origin from the active Hermes gateway session."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    return _clean_origin({
+        "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+        "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+        "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+        "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+    })
+
+
 def _try_notify_user(
     workflow_id: str,
     action_id: str,
     question: str,
     origin_platform: Optional[str],
     origin_chat_id: Optional[str],
+    origin_thread_id: Optional[str] = None,
 ) -> None:
     """Best-effort notification: tell the user there's a pending question.
 
@@ -92,35 +130,26 @@ def _try_notify_user(
         return
 
     try:
-        from .scheduler import _gateway_ref
-        gateway = _gateway_ref
+        from .scheduler import send_gateway_message
     except ImportError:
-        return
-
-    if gateway is None:
-        return
+        try:
+            from scheduler import send_gateway_message  # type: ignore
+        except ImportError:
+            return
 
     try:
-        adapters = getattr(gateway, "adapters", {}) or {}
-        for plat, adapter in adapters.items():
-            plat_str = plat.value if hasattr(plat, "value") else str(plat)
-            if plat_str.lower() == origin_platform.lower():
-                import asyncio
-                loop = getattr(gateway, "loop", None)
-                message = (
-                    f"⏳ **Workflow needs your input**\n\n"
-                    f"> {question}\n\n"
-                    f"Reply directly in this chat with your answer, "
-                    f"or use `/workflows respond {action_id} <your answer>`."
-                )
-                if loop and loop.is_running():
-                    async def _send():
-                        try:
-                            await adapter.send(origin_chat_id, message)
-                        except Exception:
-                            pass
-                    asyncio.run_coroutine_threadsafe(_send(), loop)
-                break
+        message = (
+            f"Workflow needs your input\n\n"
+            f"> {question}\n\n"
+            f"Reply directly in this chat with your answer, "
+            f"or use `/workflows respond {action_id} <your answer>`."
+        )
+        send_gateway_message(
+            origin_platform,
+            origin_chat_id,
+            message,
+            thread_id=origin_thread_id,
+        )
     except Exception:
         pass  # Best-effort — never let notification failure block the pause
 
@@ -138,20 +167,8 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
     trigger_at = (args.get("trigger_at") or "").strip() or None
     trigger_in = (args.get("trigger_in") or "").strip() or None
 
-    # Extract origin from args (always present — db.create_workflow defaults to {"platform": "web"})
-    origin_raw = args.get("origin")
-    origin: Optional[Dict[str, Any]] = None
-    if isinstance(origin_raw, dict):
-        origin = {
-            "platform": (origin_raw.get("platform") or "").strip() or None,
-            "chat_id": (origin_raw.get("chat_id") or "").strip() or None,
-            "thread_id": (origin_raw.get("thread_id") or "").strip() or None,
-            "user_id": (origin_raw.get("user_id") or "").strip() or None,
-        }
-        # Remove None values
-        origin = {k: v for k, v in origin.items() if v is not None}
-        if not origin:
-            origin = None
+    # Prefer explicit origin, otherwise infer it from the active gateway session.
+    origin = _clean_origin(args.get("origin")) or _origin_from_session_env()
 
     # Extract delivery target — required, no default
     deliver = (args.get("deliver") or "").strip()
@@ -338,13 +355,7 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
         if "origin" in args and args["origin"] is not None:
             origin_raw = args["origin"]
             if isinstance(origin_raw, dict):
-                origin_clean = {
-                    "platform": (origin_raw.get("platform") or "").strip() or None,
-                    "chat_id": (origin_raw.get("chat_id") or "").strip() or None,
-                    "thread_id": (origin_raw.get("thread_id") or "").strip() or None,
-                    "user_id": (origin_raw.get("user_id") or "").strip() or None,
-                }
-                origin_clean = {k: v for k, v in origin_clean.items() if v is not None}
+                origin_clean = _clean_origin(origin_raw)
                 update_kwargs["origin"] = origin_clean if origin_clean else None
 
         # Handle deliver update — validate if provided
@@ -660,6 +671,7 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
 
         action = db.create_pending_action(
             workflow_id=current_wf,
+            run_id=_get_current_run_id(kwargs),
             question=question,
             context=context,
             max_wait_seconds=max_wait_seconds,
@@ -677,6 +689,7 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
             question=question,
             origin_platform=origin_platform,
             origin_chat_id=origin_chat_id,
+            origin_thread_id=origin_thread_id,
         )
 
         result = {
@@ -727,6 +740,17 @@ def _handle_submit_response(args: Dict[str, Any], **kwargs: Any) -> str:
                 "message": f"No pending action found with ID '{action_id}'. It may have already been resolved or dismissed.",
             })
 
+        # Resume immediately after manual tool submission, matching the slash
+        # command and chat-reply path. Delivery is handled by the scheduler.
+        try:
+            from .scheduler import trigger_workflow_now
+        except ImportError:
+            from scheduler import trigger_workflow_now  # type: ignore
+        try:
+            trigger_workflow_now(resolved["workflow_id"])
+        except Exception:
+            logger.debug("Failed to trigger workflow after response", exc_info=True)
+
         return json.dumps({
             "success": True,
             "action_id": action_id,
@@ -734,7 +758,7 @@ def _handle_submit_response(args: Dict[str, Any], **kwargs: Any) -> str:
             "status": "resolved",
             "message": (
                 f"Response submitted for '{action_id}'. "
-                f"The workflow will see this response on its next scheduled run."
+                f"The workflow is resuming now."
             ),
         })
     except Exception as e:
@@ -845,36 +869,20 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
                 ),
             })
 
-        # ── Use gateway reference to send ────────────────────────────
         try:
-            from .scheduler import _gateway_ref
-            gateway = _gateway_ref
+            from .scheduler import send_gateway_message
         except ImportError:
-            return json.dumps({"error": "Gateway reference not available — message delivery is only supported at runtime."})
+            try:
+                from scheduler import send_gateway_message  # type: ignore
+            except ImportError:
+                return json.dumps({"error": "Gateway delivery is only supported at runtime."})
 
-        if gateway is None:
-            return json.dumps({
-                "success": False,
-                "message": "Gateway reference not yet available. Try again later or use workflow_wait_for_user to interact.",
-            })
-
-        # Find matching adapter
-        adapters = getattr(gateway, "adapters", {}) or {}
-        sent = False
-        for plat, adapter in adapters.items():
-            plat_str = plat.value if hasattr(plat, "value") else str(plat)
-            if plat_str.lower() == target_platform.lower():
-                import asyncio
-                loop = getattr(gateway, "loop", None)
-                if loop and loop.is_running():
-                    async def _send():
-                        try:
-                            await adapter.send(target_chat_id, message)
-                        except Exception:
-                            pass
-                    asyncio.run_coroutine_threadsafe(_send(), loop)
-                    sent = True
-                break
+        sent = send_gateway_message(
+            target_platform,
+            str(target_chat_id),
+            message,
+            thread_id=(origin.get("thread_id") or "").strip() or None,
+        )
 
         if sent:
             return json.dumps({

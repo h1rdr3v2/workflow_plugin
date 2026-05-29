@@ -240,7 +240,7 @@ def _fire(workflow_id: str) -> None:
             _deliver_workflow_output(workflow_id, run_info)
 
             # Auto-disable one-shot workflows after they fire
-            _auto_disable_oneshot(workflow_id)
+            _auto_disable_oneshot(workflow_id, run_info)
 
     except Exception:
         logger.exception("Unhandled error in executor for workflow '%s'", workflow_id)
@@ -255,9 +255,15 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
     """
     status = run_info.get("status", "")
     summary = (run_info.get("output_summary") or "").strip()
+    error_message = (run_info.get("error_message") or "").strip()
 
-    # Only deliver on success (not paused, not error, not skipped)
-    if status != "success" or not summary:
+    # Paused runs notify through workflow_wait_for_user; skipped runs are
+    # internal scheduler bookkeeping and should not bother the user.
+    if status in {"paused", "skipped"}:
+        return
+    if status == "success" and not summary:
+        return
+    if status == "error" and not error_message:
         return
 
     # ── Load workflow to get deliver + origin ─────────────────────────
@@ -301,10 +307,16 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
         return
 
     # ── Send via gateway adapter ──────────────────────────────────────
+    if status == "error":
+        message = f"Workflow `{workflow_id}` failed\n\n{error_message}"
+    else:
+        message = f"Workflow `{workflow_id}` completed\n\n{summary}"
+
     _send_via_gateway(
         target_platform,
         str(target_chat_id),
-        f"📋 **Workflow `{workflow_id}` completed**\n\n{summary}",
+        message,
+        thread_id=(origin.get("thread_id") or "").strip() or None,
     )
 
 
@@ -332,15 +344,29 @@ def _send_via_gateway(
     platform_str: str,
     chat_id: str,
     message: str,
+    thread_id: Optional[str] = None,
 ) -> None:
     """Send a message through the gateway adapter matching platform_str.
 
     Best-effort — never raises, never blocks the scheduler.
     """
     global _gateway_ref
+    send_gateway_message(platform_str, chat_id, message, thread_id=thread_id)
+
+
+def send_gateway_message(
+    platform_str: Optional[str],
+    chat_id: Optional[str],
+    message: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Send a message through the live gateway adapter, if available."""
+    global _gateway_ref
+    if not platform_str or not chat_id:
+        return False
     if _gateway_ref is None:
         logger.debug("No gateway reference available for delivery to %s", platform_str)
-        return
+        return False
 
     try:
         adapters = getattr(_gateway_ref, "adapters", {}) or {}
@@ -352,13 +378,23 @@ def _send_via_gateway(
                 if loop and loop.is_running():
                     async def _send():
                         try:
-                            await adapter.send(chat_id, message)
+                            metadata = {"thread_id": thread_id} if thread_id else None
+                            await adapter.send(str(chat_id), message, metadata=metadata)
+                        except TypeError:
+                            await adapter.send(str(chat_id), message)
                         except Exception:
-                            pass
+                            logger.debug(
+                                "Gateway send failed to %s:%s",
+                                platform_str,
+                                chat_id,
+                                exc_info=True,
+                            )
                     asyncio.run_coroutine_threadsafe(_send(), loop)
-                break
+                    return True
+                return False
     except Exception:
-        pass  # Best-effort; don't block on failure
+        logger.debug("Gateway send scheduling failed", exc_info=True)
+    return False
 
 
 # ── Timeout checker ───────────────────────────────────────────────────────
@@ -419,7 +455,8 @@ def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
         run_info = _executor(workflow_id)
 
         if isinstance(run_info, dict):
-            _auto_disable_oneshot(workflow_id)
+            _deliver_workflow_output(workflow_id, run_info)
+            _auto_disable_oneshot(workflow_id, run_info)
 
         return run_info
     except Exception:
@@ -427,8 +464,11 @@ def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _auto_disable_oneshot(workflow_id: str) -> None:
+def _auto_disable_oneshot(workflow_id: str, run_info: Optional[Dict[str, Any]] = None) -> None:
     """If a workflow is a one-shot, disable it after it fires."""
+    status = (run_info or {}).get("status")
+    if status in {"paused", "running", "skipped"}:
+        return
     try:
         try:
             from .db import get_db
