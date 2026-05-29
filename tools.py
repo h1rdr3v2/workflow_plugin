@@ -43,15 +43,36 @@ def _validate_deliver(deliver_value: str) -> str | None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
+# Module-level workflow context — set by _invoke_with_context before the
+# AIAgent runs so tool handlers can discover which workflow they belong to.
+_WF_CTX: Dict[str, str] = {}
+
+
+def set_workflow_context(workflow_id: str, run_id: str = "") -> None:
+    """Store the current workflow context for tool handlers."""
+    _WF_CTX["workflow_id"] = workflow_id
+    _WF_CTX["run_id"] = run_id
+
+
+def clear_workflow_context() -> None:
+    """Clear the current workflow context."""
+    _WF_CTX.clear()
+
+
 def _get_current_workflow_id(kwargs: Dict[str, Any]) -> str | None:
     """
     Extract the workflow_id from the execution context.
 
-    In a workflow run, kwargs includes the workflow_id of the currently
-    executing workflow. For tools called outside a workflow run (e.g.,
-    create, list), this returns None.
+    Checks (in order):
+    1. ``kwargs["workflow_id"]`` — set by Hermes session metadata
+    2. Module-level ``_WF_CTX`` — set by the workflow executor
+
+    For tools called outside a workflow run (e.g. create, list), returns None.
     """
-    return (kwargs.get("workflow_id") or "").strip() or None
+    from_kwargs = (kwargs.get("workflow_id") or "").strip()
+    if from_kwargs:
+        return from_kwargs
+    return _WF_CTX.get("workflow_id") or None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
