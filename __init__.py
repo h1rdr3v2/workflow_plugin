@@ -456,9 +456,12 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     """Internal: invoke the agent via subprocess (``hermes -z``).
 
     PluginContext does not expose create_session / send_message — we shell
-    out to ``hermes --oneshot`` with the workflow tools, same pattern
-    Hermes cron uses for its agent runs.
+    out to ``hermes --oneshot`` with the workflow tools.  After the
+    subprocess completes, we parse stdout for ``__WORKFLOW_DELIVER__``
+    markers emitted by the workflow agent and deliver them through the
+    parent process's gateway (which has access to the platform adapters).
     """
+    import re
     import subprocess
 
     workflow_id = kw.get("workflow_id", "")
@@ -466,7 +469,6 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     system_prompt = kw.get("system_prompt", "")
     user_message = kw.get("user_message", "")
 
-    # Build the full prompt — system prompt first, then user message
     full_prompt = f"{system_prompt}\n\n{user_message}"
 
     try:
@@ -480,6 +482,20 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
         )
 
         output = (result.stdout or "").strip()
+
+        # ── Extract and deliver workflow messages ──────────────────
+        for match in re.finditer(r"__WORKFLOW_DELIVER__:(.*?)$", output, re.MULTILINE):
+            try:
+                payload = json.loads(match.group(1))
+                _deliver_subprocess_message(payload)
+            except Exception:
+                logger.exception("Failed to deliver workflow subprocess message")
+
+        # Strip markers from the output so they don't clutter the summary
+        output = re.sub(
+            r"__WORKFLOW_DELIVER__:.*?$", "", output, flags=re.MULTILINE,
+        ).strip()
+
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             logger.error(
@@ -495,6 +511,35 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.exception("Agent invocation failed for workflow '%s'", workflow_id)
         raise
+
+
+def _deliver_subprocess_message(payload: dict) -> None:
+    """Deliver a message emitted by a subprocess workflow agent.
+
+    Uses the parent process's gateway reference (set by the
+    ``pre_gateway_dispatch`` hook).  If the gateway isn't available
+    yet (e.g. cron-fired workflow before any user interaction), logs
+    a warning and skips.
+    """
+    platform = (payload.get("platform") or "").strip()
+    chat_id = (payload.get("chat_id") or "").strip()
+    message = (payload.get("message") or "").strip()
+
+    if not platform or not chat_id or not message:
+        return
+
+    from .scheduler import _gateway_ref
+
+    gateway = _gateway_ref
+    if gateway is None:
+        logger.warning(
+            "Cannot deliver subprocess message to %s/%s: gateway ref not set "
+            "(no pre_gateway_dispatch has fired yet)",
+            platform, chat_id,
+        )
+        return
+
+    _send_via_gateway(gateway, platform, chat_id, message)
 
 
 # ── register() — plugin entry point ───────────────────────────────────────

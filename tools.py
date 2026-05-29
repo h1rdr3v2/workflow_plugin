@@ -729,7 +729,6 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
         if wf is None:
             return json.dumps({"error": f"Workflow '{current_wf}' not found."})
 
-        # Every workflow has an origin
         origin = wf.get("origin") or {}
         deliver = (wf.get("deliver") or "").strip()
 
@@ -739,7 +738,7 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
                 "message": "Workflow has no deliver target set. Use workflow_update to set one.",
             })
 
-        # Resolve delivery target: which platform + chat_id to use
+        # Resolve delivery target
         target_platform: Optional[str] = None
         target_chat_id: Optional[str] = None
 
@@ -750,11 +749,9 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
             })
 
         if deliver == "origin":
-            # Send to the platform/chat where this workflow was created
             target_platform = (origin.get("platform") or "").strip() or None
             target_chat_id = (origin.get("chat_id") or "").strip() or None
         else:
-            # deliver is a specific platform name like "discord", "telegram"
             target_platform = deliver
             target_chat_id = (origin.get("chat_id") or "").strip() or None
 
@@ -769,12 +766,27 @@ def _handle_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
                 "success": False,
                 "message": (
                     f"Cannot deliver message to '{target_platform}': "
-                    f"no chat_id in origin. Set origin.chat_id via "
-                    f"workflow_update or the dashboard."
+                    f"no chat_id in origin. Update the workflow's origin "
+                    f"to include a chat_id (e.g. via workflow_update or dashboard)."
                 ),
             })
 
-        # Use the gateway reference to send the message
+        # ── Subprocess mode: emit stdout marker for parent to deliver ──
+        in_subprocess = bool(os.environ.get("HERMES_WORKFLOW_ID"))
+        if in_subprocess:
+            payload = json.dumps({
+                "platform": target_platform,
+                "chat_id": target_chat_id,
+                "thread_id": origin.get("thread_id"),
+                "message": message,
+            })
+            print(f"__WORKFLOW_DELIVER__:{payload}", flush=True)
+            return json.dumps({
+                "success": True,
+                "message": f"Message queued for delivery to {target_platform}.",
+            })
+
+        # ── Main process mode: use gateway reference ──────────────────
         try:
             from .scheduler import _gateway_ref
             gateway = _gateway_ref
