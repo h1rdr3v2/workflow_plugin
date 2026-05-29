@@ -501,6 +501,9 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
 
     from run_agent import AIAgent
 
+    # Tell tool handlers which workflow this is
+    tools.set_workflow_context(workflow_id, run_id)
+
     agent = AIAgent(
         model=model,
         provider=resolved_provider,
@@ -521,8 +524,7 @@ def _invoke_with_context(ctx: Any, **kw: Any) -> Dict[str, Any]:
             summary = result.get("final_response", "") or result.get("text", "")
         return {"summary": summary}
     finally:
-        # AIAgent holds provider connections; let GC handle cleanup
-        pass
+        tools.clear_workflow_context()
 
 
 # ── register() — plugin entry point ───────────────────────────────────────
