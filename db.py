@@ -119,6 +119,7 @@ class WorkflowDB:
         origin: Optional[Dict[str, Any]] = None,
         trigger_type: str = "cron",
         deliver: str = "local",
+        notify: str = "summary",
     ) -> Dict[str, Any]:
         """Create a new workflow. Raises ValueError if id already exists."""
         now = time.time()
@@ -143,6 +144,7 @@ class WorkflowDB:
                 "origin": origin,
                 "trigger_type": trigger_type,
                 "deliver": deliver,
+                "notify": notify,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -180,6 +182,7 @@ class WorkflowDB:
         origin: Optional[Dict[str, Any]] = None,
         trigger_type: Optional[str] = None,
         deliver: Optional[str] = None,
+        notify: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update fields on an existing workflow. Returns updated dict or None."""
         now = time.time()
@@ -204,6 +207,8 @@ class WorkflowDB:
                         w["trigger_type"] = trigger_type
                     if deliver is not None:
                         w["deliver"] = deliver
+                    if notify is not None:
+                        w["notify"] = notify
                     w["updated_at"] = now
                     _write_json(self._workflows_path, workflows)
                     logger.info("Workflow updated: id=%s", workflow_id)

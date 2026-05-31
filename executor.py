@@ -150,13 +150,13 @@ def execute(workflow_id: str) -> Dict[str, Any]:
         # The agent invocation returns a dict; we check if it paused
         finished_at = time.time()
 
-        # Check if the agent created a pending action during this run
+        # Check if the agent paused this run by calling workflow_wait_for_user.
+        # Match on run_id (stamped onto the action when it was created) so a
+        # pending action left over from another run can't be misattributed.
         pending = db.list_pending_actions(workflow_id=workflow_id, status="pending")
-        paused_action = None
-        for pa in pending:
-            if pa.get("run_id") == run_id or pa.get("created_at", 0) >= started_at:
-                paused_action = pa
-                break
+        paused_action = next(
+            (pa for pa in pending if pa.get("run_id") == run_id), None
+        )
 
         if paused_action:
             run_info.update({
@@ -294,7 +294,10 @@ def _build_system_prompt(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
                  "It delivers your question to the user automatically — do NOT also send the same question with "
                  "send_message or workflow_send_message first (that would post it twice).")
     parts.append("5. If you see resolved responses above, incorporate them now.")
-    parts.append("6. When your run completes, produce a concise summary as your final response — it will be delivered to the user automatically.")
+    parts.append("6. End with a concise summary of what you did as your final response. Depending on this "
+                 "workflow's notify setting it may be delivered to the user verbatim, condensed to a "
+                 "completion line, or suppressed — so keep it short and don't repeat anything you already "
+                 "sent via workflow_send_message.")
     parts.append("7. You have access to ALL hermes-agent tools: terminal, browser, curl/fetch, file operations, etc. Use them freely to accomplish the workflow's goal.")
 
     return "\n".join(parts)

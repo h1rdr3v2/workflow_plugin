@@ -77,6 +77,18 @@ WORKFLOW_CREATE = {
                 "description": "Where to deliver workflow output and messages. 'local', 'discord', 'telegram', 'slack', 'email', or 'origin' (agent-only — uses creation context).",
                 "enum": ["local", "discord", "telegram", "slack", "email", "origin"],
             },
+            "notify": {
+                "type": "string",
+                "description": (
+                    "How much to tell the user when a run finishes successfully. "
+                    "'summary' (default): deliver the agent's final summary. "
+                    "'minimal': deliver only a static '✅ Workflow <name> completed' line "
+                    "— best for side-effect jobs where the result isn't a message. "
+                    "'silent': deliver nothing on success (errors are still reported). "
+                    "Pick 'summary' for workflows whose output IS the message (e.g. a daily digest)."
+                ),
+                "enum": ["summary", "minimal", "silent"],
+            },
         },
         "required": ["workflow_id", "name", "prompt", "deliver"],
     },
@@ -136,6 +148,11 @@ WORKFLOW_UPDATE = {
                 "type": "string",
                 "description": "Optional: update delivery target. 'local', 'discord', 'telegram', 'slack', 'email', or 'origin' (agent-only).",
                 "enum": ["local", "discord", "telegram", "slack", "email", "origin"],
+            },
+            "notify": {
+                "type": "string",
+                "description": "Optional: update success-notification verbosity. 'summary' (deliver the run summary), 'minimal' (static completion line), or 'silent' (nothing on success; errors still reported).",
+                "enum": ["summary", "minimal", "silent"],
             },
         },
         "required": ["workflow_id"],
@@ -401,13 +418,15 @@ WORKFLOW_LIST_PENDING = {
 WORKFLOW_SEND_MESSAGE = {
     "name": "workflow_send_message",
     "description": (
-        "Send a message to the chat where this workflow was created. "
-        "Use this to give the user a status update, share results, or "
-        "communicate mid-run without pausing for input.\n\n"
-        "Only works if the workflow has an 'origin' configured (the "
-        "platform and chat_id where it was created).\n\n"
-        "The workflow_id is automatically inferred from the current "
-        "execution context — you only need to provide the message."
+        "Send a one-way status update or result to the workflow's chat "
+        "mid-run, without pausing.\n\n"
+        "DO NOT use this to ask a question that needs an answer — use "
+        "workflow_wait_for_user, which delivers the question to the user "
+        "ITSELF. Sending the question here first and then calling "
+        "workflow_wait_for_user posts it to the user twice.\n\n"
+        "Only works if the workflow has an 'origin'/'deliver' target "
+        "configured. The workflow_id is inferred automatically — you only "
+        "need to provide the message."
     ),
     "parameters": {
         "type": "object",
@@ -469,24 +488,3 @@ WORKFLOW_ENABLE = {
         "required": ["workflow_id"],
     },
 }
-
-# ═══════════════════════════════════════════════════════════════════════════
-# All schemas
-# ═══════════════════════════════════════════════════════════════════════════
-
-ALL_SCHEMAS = [
-    WORKFLOW_CREATE,
-    WORKFLOW_UPDATE,
-    WORKFLOW_DELETE,
-    WORKFLOW_LIST,
-    WORKFLOW_GET,
-    WORKFLOW_SAVE_STATE,
-    WORKFLOW_LOAD_STATE,
-    WORKFLOW_DELETE_STATE,
-    WORKFLOW_WAIT_FOR_USER,
-    WORKFLOW_SUBMIT_RESPONSE,
-    WORKFLOW_LIST_PENDING,
-    WORKFLOW_SEND_MESSAGE,
-    WORKFLOW_DISABLE,
-    WORKFLOW_ENABLE,
-]

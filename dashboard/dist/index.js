@@ -62,6 +62,9 @@
 		var _deliver = useState(editWf ? editWf.deliver || "local" : "local"),
 			deliver = _deliver[0],
 			setDeliver = _deliver[1]
+		var _notify = useState(editWf ? editWf.notify || "summary" : "summary"),
+			notify = _notify[0],
+			setNotify = _notify[1]
 		var _saving = useState(false),
 			saving = _saving[0],
 			setSaving = _saving[1]
@@ -124,6 +127,7 @@
 							cron_expression: cron,
 							prompt: prompt,
 							deliver: deliver,
+							notify: notify,
 						}
 					: {
 							id: wfId,
@@ -132,6 +136,7 @@
 							cron_expression: cron,
 							prompt: prompt,
 							deliver: deliver,
+							notify: notify,
 						}
 
 				fetchJSON(url, { method: method, body: JSON.stringify(body) })
@@ -160,6 +165,7 @@
 				cron,
 				prompt,
 				deliver,
+				notify,
 				isEdit,
 				onClose,
 				onToast,
@@ -292,6 +298,37 @@
 							React.createElement("option", { value: "telegram" }, "telegram"),
 							React.createElement("option", { value: "slack" }, "slack"),
 							React.createElement("option", { value: "email" }, "email"),
+						),
+					),
+					React.createElement(
+						"div",
+						{ className: "grid gap-2" },
+						React.createElement(Label, null, "Notify on success"),
+						React.createElement(
+							"select",
+							{
+								value: notify,
+								onChange: function (e) {
+									setNotify(e.target.value)
+								},
+								className:
+									"flex h-9 w-full border border-border bg-background/40 px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30",
+							},
+							React.createElement(
+								"option",
+								{ value: "summary" },
+								"summary — send the run's summary",
+							),
+							React.createElement(
+								"option",
+								{ value: "minimal" },
+								"minimal — just a completion line",
+							),
+							React.createElement(
+								"option",
+								{ value: "silent" },
+								"silent — nothing on success",
+							),
 						),
 					),
 					React.createElement(

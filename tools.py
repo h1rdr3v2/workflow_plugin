@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # ── Valid delivery targets ───────────────────────────────────────────────
 VALID_DELIVER_VALUES = frozenset({"local", "discord", "telegram", "slack", "email", "origin"})
 
+# ── Valid success-notification modes ─────────────────────────────────────
+VALID_NOTIFY_VALUES = frozenset({"summary", "minimal", "silent"})
+
 
 def _validate_deliver(deliver_value: str) -> str | None:
     """Validate a deliver value. Returns error message or None if valid."""
@@ -38,6 +41,14 @@ def _validate_deliver(deliver_value: str) -> str | None:
         return "deliver is required. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
     if v not in VALID_DELIVER_VALUES:
         return "Invalid deliver target '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    return None
+
+
+def _validate_notify(notify_value: str) -> str | None:
+    """Validate a notify value. Returns error message or None if valid."""
+    v = (notify_value or "").strip()
+    if v not in VALID_NOTIFY_VALUES:
+        return "Invalid notify mode '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_NOTIFY_VALUES))
     return None
 
 
@@ -171,6 +182,9 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
     # Extract delivery target — required, no default
     deliver = (args.get("deliver") or "").strip()
 
+    # Success-notification verbosity — optional, defaults to "summary"
+    notify = (args.get("notify") or "summary").strip()
+
     # Validation
     if not workflow_id:
         return json.dumps({"error": "workflow_id is required"})
@@ -183,6 +197,11 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
     deliver_error = _validate_deliver(deliver)
     if deliver_error:
         return json.dumps({"error": deliver_error})
+
+    # Validate notify
+    notify_error = _validate_notify(notify)
+    if notify_error:
+        return json.dumps({"error": notify_error})
 
     # Determine trigger type: cron, one-shot by timestamp, or one-shot by duration
     trigger_type = "cron"
@@ -230,6 +249,7 @@ def _handle_create(args: Dict[str, Any], **kwargs: Any) -> str:
             origin=origin,
             trigger_type=trigger_type,
             deliver=deliver,
+            notify=notify,
         )
 
         # Schedule it immediately (handles both cron and one-shot DateTrigger)
@@ -363,6 +383,14 @@ def _handle_update(args: Dict[str, Any], **kwargs: Any) -> str:
             if err:
                 return json.dumps({"error": err})
             update_kwargs["deliver"] = deliver_val
+
+        # Handle notify update — validate if provided
+        if "notify" in args and args["notify"] is not None:
+            notify_val = str(args["notify"]).strip()
+            err = _validate_notify(notify_val)
+            if err:
+                return json.dumps({"error": err})
+            update_kwargs["notify"] = notify_val
 
         result = db.update_workflow(workflow_id, **update_kwargs)
 
@@ -739,13 +767,14 @@ def _handle_submit_response(args: Dict[str, Any], **kwargs: Any) -> str:
             })
 
         # Resume immediately after manual tool submission, matching the slash
-        # command and chat-reply path. Delivery is handled by the scheduler.
+        # command and chat-reply path. Run off-thread (delivery is handled by
+        # the scheduler) so this never blocks the caller's event loop.
         try:
-            from .scheduler import trigger_workflow_now
+            from .scheduler import trigger_workflow_now_async
         except ImportError:
-            from scheduler import trigger_workflow_now  # type: ignore
+            from scheduler import trigger_workflow_now_async  # type: ignore
         try:
-            trigger_workflow_now(resolved["workflow_id"])
+            trigger_workflow_now_async(resolved["workflow_id"])
         except Exception:
             logger.debug("Failed to trigger workflow after response", exc_info=True)
 

@@ -1,13 +1,13 @@
 # Workflow Engine Plugin for Hermes
 
-A first-class **workflow engine** that lets users and agents create scheduled cron-like workflows with persistent per-workflow state and human-in-the-loop interactions.
+A first-class **workflow engine** that lets users and agents create scheduled, cron-like workflows with persistent per-workflow state and human-in-the-loop interactions.
 
 ## What It Does
 
-- **Create workflows** — define a named job with a cron schedule and agent prompt, via chat or dashboard
-- **Built-in scheduler** — croniter-based polling loop manages all cron triggers, no reliance on Hermes cron
+- **Create workflows** — define a named job with a cron (or one-shot) schedule and an agent prompt, via chat or dashboard
+- **Built-in scheduler** — a croniter-based polling loop manages all triggers; no reliance on Hermes cron
 - **Persistent state** — each workflow has its own namespaced key-value store that survives across runs
-- **Human-in-the-loop** — agents can pause mid-run and ask a human for input; the response is injected on the next tick
+- **Human-in-the-loop** — agents can pause mid-run and ask a human for input; the answer resumes the workflow immediately
 - **Dashboard** — full UI for creating, editing, enabling/disabling, and monitoring workflows
 
 ## Quick Start
@@ -26,7 +26,8 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 ### Creating Your First Workflow (via agent chat)
 
 ```
-User: Create a workflow that rotates PR review assignments every weekday at 9am among Alice, Bob, and Carol. If you're unsure about an assignment, ask me.
+User: Create a workflow that rotates PR review assignments every weekday at 9am
+      among Alice, Bob, and Carol. If you're unsure about an assignment, ask me.
 
 Agent: [calls workflow_create with appropriate params]
 
@@ -37,14 +38,13 @@ Agent: [calls workflow_create with appropriate params]
 
 ```
 ~/.hermes/plugins/workflow/
-├── plugin.yaml              # Manifest: 11 tools, 2 hooks
-├── __init__.py              # register(ctx) — wires tools, hooks, scheduler, skill
-├── models.py                # Workflow, WorkflowRun, PendingAction dataclasses
-├── db.py                    # SQLite layer (workflow_engine.db) — 3 tables
-├── scheduler.py             # croniter-based polling scheduler
-├── executor.py              # Runs a single workflow tick
-├── schemas.py               # 11 LLM-visible tool definitions
-├── tools.py                 # 11 tool handler implementations
+├── plugin.yaml              # Manifest: 14 tools, 2 hooks
+├── __init__.py              # register(ctx) — wires tools, hooks, scheduler, skill, agent invocation
+├── db.py                    # JSON-file store (~/.hermes/workflow_engine/)
+├── scheduler.py             # croniter-based polling scheduler + gateway delivery
+├── executor.py              # Builds the prompt and runs a single workflow tick (in-process AIAgent)
+├── schemas.py               # LLM-visible tool definitions
+├── tools.py                 # Tool handler implementations
 ├── skills/
 │   └── workflow-agent/
 │       └── SKILL.md          # Teaches agents the workflow pattern
@@ -52,62 +52,80 @@ Agent: [calls workflow_create with appropriate params]
 │   ├── manifest.json         # Sidebar tab config
 │   ├── plugin_api.py         # FastAPI backend routes
 │   └── dist/
-│       └── index.js          # React UI (IIFE, no build step)
+│       └── index.js          # React UI (hand-written IIFE, no build step)
 └── README.md
 ```
 
 ## Tools
 
-| #   | Tool                       | Purpose                                              |
-| --- | -------------------------- | ---------------------------------------------------- |
-| 1   | `workflow_create`          | Create a new scheduled workflow                      |
-| 2   | `workflow_update`          | Modify a workflow (schedule, prompt, enable/disable) |
-| 3   | `workflow_delete`          | Delete a workflow and all its state                  |
-| 4   | `workflow_list`            | List all workflows with status                       |
-| 5   | `workflow_get`             | Get full details of a workflow + state + pending     |
-| 6   | `workflow_save_state`      | Persist a key-value pair for the current workflow    |
-| 7   | `workflow_load_state`      | Retrieve a saved state value                         |
-| 8   | `workflow_delete_state`    | Remove a state key                                   |
-| 9   | `workflow_wait_for_user`   | Pause and ask a human a question                     |
-| 10  | `workflow_submit_response` | Human answers a pending question                     |
-| 11  | `workflow_list_pending`    | List all pending human-input requests                |
+| Tool                       | Purpose                                                          |
+| -------------------------- | ---------------------------------------------------------------- |
+| `workflow_create`          | Create a new scheduled (or one-shot) workflow                    |
+| `workflow_update`          | Modify a workflow (schedule, prompt, origin, deliver, notify, …) |
+| `workflow_delete`          | Delete a workflow and all its state                              |
+| `workflow_list`            | List all workflows with status                                   |
+| `workflow_get`             | Get full details of a workflow + state keys + pending            |
+| `workflow_enable`          | Re-enable a paused workflow                                      |
+| `workflow_disable`         | Pause a workflow (stops it firing until re-enabled)              |
+| `workflow_save_state`      | Persist a key-value pair for the current workflow                |
+| `workflow_load_state`      | Retrieve a saved state value                                     |
+| `workflow_delete_state`    | Remove a state key                                               |
+| `workflow_wait_for_user`   | Pause and ask a human a question (delivers it to the chat)       |
+| `workflow_submit_response` | Record a human's answer to a pending question                    |
+| `workflow_list_pending`    | List all pending human-input requests                            |
+| `workflow_send_message`    | Send a one-way status update/result to the workflow's chat       |
 
 ## Hooks
 
-| Hook              | Purpose                                                                                         |
-| ----------------- | ----------------------------------------------------------------------------------------------- |
-| `pre_llm_call`    | Injects workflow state + pending/resolved responses into agent context at the start of each run |
-| `plugin_shutdown` | Gracefully stops the scheduler                                                                  |
+| Hook                   | Purpose                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `pre_gateway_dispatch` | Captures a user's chat reply as the answer to a paused workflow question and resumes the workflow off-thread     |
+| `plugin_shutdown`      | Gracefully stops the scheduler                                                                                  |
+
+> Workflow state, resolved responses, and pending questions are injected directly into the agent's system prompt by `executor._build_system_prompt` at run time — there is no `pre_llm_call` hook (Hermes does not pass a `workflow_id` to that hook, so it could not identify the running workflow).
 
 ## Human Interface
 
 - **`/workflows`** — list all workflows and pending actions
 - **`/workflows respond <action_id> <answer>`** — respond to a pending question
 - **`/workflows dismiss <action_id>`** — dismiss without responding
+- **Reply in chat** — if a workflow has an `origin`, replying in that chat is captured as the answer (best-effort)
 - **Dashboard tab** — full CRUD, state inspection, pending action management
+
+## Delivery & Notification
+
+Each workflow has two delivery-related settings:
+
+- **`deliver`** — where output and messages go: `local` (no chat delivery), a platform (`discord`, `telegram`, `slack`, `email`), or `origin` (the chat it was created in).
+- **`notify`** — how much to say when a run *succeeds*:
+  - `summary` (default) — deliver the agent's final summary
+  - `minimal` — deliver only a static `✅ Workflow <name> completed` line (best for side-effect jobs)
+  - `silent` — deliver nothing on success (errors are always reported)
 
 ## Execution Flow
 
 ```
-Scheduler triggers cron tick
-  → Load workflow definition + saved state + resolved responses
-    → Build enriched agent prompt
-      → Agent runs, calling tools (load_state, save_state, wait_for_user, etc.)
+Scheduler fires a tick (cron, one-shot timer, or immediate resume)
+  → Executor loads workflow + state + resolved responses
+    → Builds the system prompt (state/responses/pending injected here)
+      → Runs an in-process AIAgent with the full Hermes tool surface
         → Run recorded as: success | paused (awaiting human) | error
+          → Output delivered per `deliver` + `notify`
 ```
 
-- **Overlap protection**: if a workflow has an unresolved pending action, the scheduler skips the tick (workflow is effectively "paused")
-- **Manual trigger**: you can run any workflow ad-hoc via the dashboard or API without waiting for its cron schedule
+- **Overlap protection** — a workflow with an unresolved pending action won't trigger again until it's resolved.
+- **Immediate resume** — a human response (chat reply, `/workflows respond`, dashboard, or `workflow_submit_response`) resumes the workflow at once. Resumes always run on a background thread, never on the gateway/web event loop.
+- **One-shot** — workflows created with `trigger_at`/`trigger_in` fire once and auto-disable.
 
-## Database
+## Storage
 
-State is stored in `~/.hermes/workflow_engine.db` (SQLite, WAL mode):
+State lives under `~/.hermes/workflow_engine/` as plain JSON (atomic writes, thread-safe):
 
-| Table             | Purpose                                                                  |
-| ----------------- | ------------------------------------------------------------------------ |
-| `workflows`       | Workflow definitions (id, name, cron, prompt, enabled)                   |
-| `workflow_state`  | Per-workflow key-value store (workflow_id, key, value)                   |
-| `pending_actions` | Human-in-the-loop requests (id, workflow_id, question, status, response) |
+| Path                       | Purpose                                                     |
+| -------------------------- | ----------------------------------------------------------- |
+| `workflows.json`           | Workflow definitions                                        |
+| `pending.json`             | Human-in-the-loop requests (question, status, response, …)  |
+| `states/{workflow_id}.json`| Per-workflow key-value state                                |
 
 All state is scoped by `workflow_id` — each workflow has its own logical namespace.
 
@@ -116,13 +134,11 @@ All state is scoped by `workflow_id` — each workflow has its own logical names
 - Hermes Agent (plugin-capable version)
 - Python 3.10+
 - `croniter` (core Hermes dependency, always available)
-- `sqlite3` (bundled with Python)
 
 ## Design Decisions
 
 - **Built-in scheduler** via croniter — workflows don't depend on Hermes cron jobs
-- **Single SQLite DB** with per-workflow namespacing — simple, portable, no external dependencies
-- **Overlap protection** — a workflow with an unresolved pending action won't trigger again until resolved
-- **Thread-safe** — same BEGIN IMMEDIATE + jitter retry pattern as Hermes's own SessionDB
-- **JSON state values** — flexible enough for any workflow shape without schema migrations
-- **All state auto-injected** — agents don't need to manually call `load_state` for every key; the `pre_llm_call` hook injects state context automatically
+- **JSON file store** — simple, portable, inspectable, no external dependencies or migrations
+- **Overlap protection** — a workflow with an unresolved pending action won't fire again until resolved
+- **Off-thread resumes** — resuming a workflow never blocks the gateway or web event loop
+- **State auto-injected** — agents don't need to manually load every key; the executor injects a state summary into the system prompt each run

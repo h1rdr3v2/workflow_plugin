@@ -30,6 +30,7 @@ router = APIRouter()
 # ── Deliver validation (inlined from tools.py to avoid relative-import trap) ──
 
 VALID_DELIVER_VALUES = frozenset({"local", "discord", "telegram", "slack", "email", "origin"})
+VALID_NOTIFY_VALUES = frozenset({"summary", "minimal", "silent"})
 
 
 def _validate_deliver(deliver_value: str) -> str | None:
@@ -39,6 +40,14 @@ def _validate_deliver(deliver_value: str) -> str | None:
         return "deliver is required. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
     if v not in VALID_DELIVER_VALUES:
         return "Invalid deliver target '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_DELIVER_VALUES))
+    return None
+
+
+def _validate_notify(notify_value: str) -> str | None:
+    """Validate a notify value. Returns error message or None if valid."""
+    v = (notify_value or "").strip()
+    if v not in VALID_NOTIFY_VALUES:
+        return "Invalid notify mode '" + v + "'. Must be one of: " + ", ".join(sorted(VALID_NOTIFY_VALUES))
     return None
 
 
@@ -109,6 +118,7 @@ def list_workflows() -> dict:
             "enabled": bool(wf["enabled"]),
             "origin": wf.get("origin"),
             "deliver": wf.get("deliver", "local"),
+            "notify": wf.get("notify", "summary"),
             "trigger_type": wf.get("trigger_type", "cron"),
             "created_at": wf["created_at"],
             "updated_at": wf["updated_at"],
@@ -152,6 +162,7 @@ def get_workflow(workflow_id: str) -> dict:
             "enabled": bool(wf["enabled"]),
             "origin": wf.get("origin"),
             "deliver": wf.get("deliver", "local"),
+            "notify": wf.get("notify", "summary"),
             "trigger_type": wf.get("trigger_type", "cron"),
             "created_at": wf["created_at"],
             "updated_at": wf["updated_at"],
@@ -197,6 +208,7 @@ async def create_workflow(request: Request) -> dict:
     description = (body.get("description") or "").strip()
     origin = body.get("origin")  # optional dict
     deliver = (body.get("deliver") or "").strip()
+    notify = (body.get("notify") or "summary").strip()
     trigger_at = (body.get("trigger_at") or "").strip() or None
     trigger_in = (body.get("trigger_in") or "").strip() or None
 
@@ -213,6 +225,11 @@ async def create_workflow(request: Request) -> dict:
     err = _validate_deliver(deliver)
     if err:
         errors.append(err)
+
+    # Validate notify
+    notify_err = _validate_notify(notify)
+    if notify_err:
+        errors.append(notify_err)
 
     # Determine trigger type
     trigger_type = "cron"
@@ -247,6 +264,7 @@ async def create_workflow(request: Request) -> dict:
             origin=origin if isinstance(origin, dict) else None,
             trigger_type=trigger_type,
             deliver=deliver,
+            notify=notify,
         )
         schedule_workflow(wf)
 
@@ -295,6 +313,13 @@ async def update_workflow(workflow_id: str, request: Request) -> dict:
         if err:
             return {"error": err}
         update_kwargs["deliver"] = deliver_val
+
+    if "notify" in body and body["notify"] is not None:
+        notify_val = str(body["notify"]).strip()
+        err = _validate_notify(notify_val)
+        if err:
+            return {"error": err}
+        update_kwargs["notify"] = notify_val
 
     if "trigger_type" in body and body["trigger_type"] is not None:
         update_kwargs["trigger_type"] = str(body["trigger_type"]).strip()
@@ -428,14 +453,16 @@ async def respond_to_pending(action_id: str, request: Request) -> dict:
     if result is None:
         return {"error": f"No pending action found with ID '{action_id}'"}
 
-    # Trigger the workflow immediately — don't wait for next cron tick
+    # Resume immediately — don't wait for next cron tick. Run off-thread so this
+    # request handler never blocks on a full agent run; delivery is handled by
+    # the scheduler.
     try:
         import sys
         _plugin_root = Path(__file__).resolve().parent.parent
         if str(_plugin_root) not in sys.path:
             sys.path.insert(0, str(_plugin_root))
-        from scheduler import trigger_workflow_now
-        trigger_workflow_now(result["workflow_id"])
+        from scheduler import trigger_workflow_now_async
+        trigger_workflow_now_async(result["workflow_id"])
     except Exception:
         pass  # Best-effort; response is already recorded
 

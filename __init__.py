@@ -1,13 +1,14 @@
 """
 Workflow Engine Plugin — Registration.
 
-The entry point for Hermes. Wires up all 11 tools, hooks, slash commands,
+The entry point for Hermes. Wires up the tools, hooks, slash command,
 the scheduler, and the bundled workflow-agent skill.
 
 Key components:
-- 11 tools: create, update, delete, list, get, save/load/delete state,
-  wait_for_user, submit_response, list_pending
-- pre_llm_call hook: injects workflow state + pending responses into agent context
+- 14 tools: create/update/delete/list/get, enable/disable, save/load/delete
+  state, wait_for_user, submit_response, list_pending, send_message
+- pre_gateway_dispatch hook: captures a user's chat reply as the answer to a
+  paused workflow question and resumes the workflow off-thread
 - plugin_shutdown hook: gracefully stops the scheduler
 - /workflows slash command: human interface to review and respond
 - workflow-agent skill: teaches the agent the workflow pattern
@@ -15,10 +16,9 @@ Key components:
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from . import executor, schemas, tools
 from . import scheduler
@@ -28,102 +28,10 @@ from .scheduler import start as scheduler_start
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# pre_llm_call hook — inject workflow context into agent sessions
-# ---------------------------------------------------------------------------
-
-
-def _inject_workflow_context(
-    session_id: str,
-    user_message: str,
-    is_first_turn: bool,
-    platform: str = "",
-    **kwargs: Any,
-) -> Optional[Dict[str, str]]:
-    """
-    Called before each LLM turn. When running inside a workflow execution
-    session, injects:
-    1. Previously saved workflow state
-    2. Any pending or recently resolved human responses
-
-    Only injects on the first turn to avoid repeating context.
-    """
-    if not is_first_turn:
-        return None
-
-    # Extract workflow_id from the session context if available
-    workflow_id = kwargs.get("workflow_id") or ""
-    if not workflow_id:
-        return None
-
-    try:
-        db = get_db()
-    except Exception:
-        return None
-
-    context_parts: List[str] = []
-    context_parts.append("[WORKFLOW ENGINE — Persistent Context]")
-
-    # ── 1. Workflow info ──────────────────────────────────────────────
-    wf = db.get_workflow(workflow_id)
-    if wf is None:
-        return None
-
-    context_parts.append(f"\n## Workflow: {wf['name']} (`{workflow_id}`)")
-    if wf.get("description"):
-        context_parts.append(f"_{wf['description']}_")
-
-    # ── 2. Saved state ────────────────────────────────────────────────
-    try:
-        state_keys = db.list_state_keys(workflow_id)
-    except Exception:
-        state_keys = []
-
-    if state_keys:
-        context_parts.append("\n## Previously Saved State")
-        context_parts.append("The following state keys are available. Use workflow_load_state() to retrieve values:")
-        for key in state_keys[:30]:
-            context_parts.append(f"- `{key}`")
-        if len(state_keys) > 30:
-            context_parts.append(f"- ... and {len(state_keys) - 30} more keys")
-    else:
-        context_parts.append("\n## No saved state yet")
-        context_parts.append("This appears to be the first run. Use workflow_save_state() to persist data for future runs.")
-
-    # ── 3. Resolved responses ─────────────────────────────────────────
-    try:
-        resolved = db.get_resolved_since(workflow_id, 0)
-    except Exception:
-        resolved = []
-
-    if resolved:
-        context_parts.append("\n## Recent Human Responses")
-        context_parts.append("These questions were answered by a human since your last run. Incorporate them:")
-        for action in resolved[:10]:
-            response_preview = (action.get("response") or "")[:500]
-            context_parts.append(
-                f"- **Q**: {action.get('question', '')[:200]}\n"
-                f"  **A**: {response_preview}"
-            )
-
-    # ── 4. Still-pending actions ──────────────────────────────────────
-    try:
-        pending = db.list_pending_actions(workflow_id=workflow_id, status="pending")
-    except Exception:
-        pending = []
-
-    if pending:
-        context_parts.append("\n## Still Pending (Awaiting Human Input)")
-        context_parts.append("These questions are waiting for a human response. Do NOT re-ask them:")
-        for action in pending[:10]:
-            context_parts.append(f"- {action.get('question', '')[:200]}")
-
-    if len(context_parts) <= 1:
-        return None
-
-    context_text = "\n".join(context_parts)
-    logger.debug("Injecting workflow context for session %s", session_id)
-    return {"context": context_text}
+# Note: workflow state, resolved responses, and pending questions are injected
+# directly into the agent's system prompt by executor._build_system_prompt at
+# run time. There is intentionally no pre_llm_call hook — Hermes does not pass a
+# workflow_id to that hook, so it could never identify the running workflow.
 
 
 # ── Slash command: /workflows ─────────────────────────────────────────────
@@ -200,11 +108,11 @@ def _handle_workflows_slash(raw_args: str) -> str:
         if result is None:
             return f"⚠️ No pending action found with ID `{action_id}`."
 
-        # Trigger the workflow immediately — don't wait for next cron tick.
-        # Output delivery is handled by scheduler._deliver_workflow_output.
+        # Resume immediately — don't wait for next cron tick. Run off-thread so
+        # the slash handler returns at once; delivery is handled by the scheduler.
         try:
-            from .scheduler import trigger_workflow_now
-            trigger_workflow_now(result["workflow_id"])
+            from .scheduler import trigger_workflow_now_async
+            trigger_workflow_now_async(result["workflow_id"])
         except Exception:
             pass  # Best-effort; the response is already recorded
 
@@ -314,10 +222,12 @@ def _handle_pre_gateway_dispatch(
             chat_id,
         )
 
-        # Trigger the workflow immediately — don't wait for next cron tick.
-        # Output delivery is handled by scheduler._deliver_workflow_output.
-        from .scheduler import trigger_workflow_now
-        trigger_workflow_now(action["workflow_id"])
+        # Resume immediately — don't wait for next cron tick. Must run OFF this
+        # thread: this hook executes on the gateway's asyncio event loop, and a
+        # synchronous agent run here would block the whole gateway. Delivery is
+        # handled by scheduler._deliver_workflow_output.
+        from .scheduler import trigger_workflow_now_async
+        trigger_workflow_now_async(action["workflow_id"])
 
         # Send a confirmation back to the user via the gateway adapter
         _send_confirmation(platform_str, str(chat_id))
@@ -546,7 +456,6 @@ def register(ctx: Any) -> None:
         )
 
     # ── Register hooks ────────────────────────────────────────────────
-    ctx.register_hook("pre_llm_call", _inject_workflow_context)
     ctx.register_hook("pre_gateway_dispatch", _handle_pre_gateway_dispatch)
     ctx.register_hook("plugin_shutdown", _on_shutdown)
 
@@ -581,6 +490,6 @@ def register(ctx: Any) -> None:
         logger.warning("Failed to start workflow scheduler", exc_info=True)
 
     logger.info(
-        "Workflow Engine v1.0.0 registered (%d tools, 3 hooks, 1 command, 1 skill)",
+        "Workflow Engine registered (%d tools, 2 hooks, 1 command, 1 skill)",
         len(schema_map),
     )

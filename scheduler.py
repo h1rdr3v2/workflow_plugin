@@ -302,6 +302,11 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
 
     Mirrors cron's _deliver_result: resolves the delivery target from the
     workflow's deliver field + origin, then sends via the gateway adapter.
+
+    The per-workflow ``notify`` setting controls success delivery:
+      - ``summary`` (default): send the agent's final summary
+      - ``minimal``: send a static "✅ Workflow <name> completed" line
+      - ``silent``: send nothing on success (errors are still delivered)
     """
     status = run_info.get("status", "")
     summary = (run_info.get("output_summary") or "").strip()
@@ -311,12 +316,8 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
     # internal scheduler bookkeeping and should not bother the user.
     if status in {"paused", "skipped"}:
         return
-    if status == "success" and not summary:
-        return
-    if status == "error" and not error_message:
-        return
 
-    # ── Load workflow to get deliver + origin ─────────────────────────
+    # ── Load workflow to get deliver + origin + notify ────────────────
     try:
         try:
             from .db import get_db
@@ -334,6 +335,24 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
     deliver = (wf.get("deliver") or "").strip()
     if deliver == "local" or not deliver:
         return  # No gateway delivery needed
+
+    # ── Build the message according to status + notify mode ───────────
+    name = wf.get("name") or workflow_id
+    notify = (wf.get("notify") or "summary").strip().lower()
+
+    if status == "error":
+        if not error_message:
+            return
+        message = f"⚠️ Workflow *{name}* failed\n\n{error_message}"
+    else:  # success
+        if notify == "silent":
+            return
+        if notify == "minimal":
+            message = f"✅ Workflow *{name}* completed"
+        else:  # "summary" (default)
+            if not summary:
+                return
+            message = f"✅ Workflow *{name}* completed\n\n{summary}"
 
     origin = wf.get("origin") or {}
 
@@ -357,11 +376,6 @@ def _deliver_workflow_output(workflow_id: str, run_info: Dict[str, Any]) -> None
         return
 
     # ── Send via gateway adapter ──────────────────────────────────────
-    if status == "error":
-        message = f"Workflow `{workflow_id}` failed\n\n{error_message}"
-    else:
-        message = f"Workflow `{workflow_id}` completed\n\n{summary}"
-
     _send_via_gateway(
         target_platform,
         str(target_chat_id),
@@ -568,6 +582,24 @@ def trigger_workflow_now(workflow_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.exception("Unhandled error in immediate trigger for workflow '%s'", workflow_id)
         return None
+
+
+def trigger_workflow_now_async(workflow_id: str) -> None:
+    """Resume a workflow off the caller's thread.
+
+    The resume paths (chat reply, /workflows respond, workflow_submit_response)
+    all fire from the gateway's asyncio event-loop thread. Running a full agent
+    conversation there would block the entire gateway — and any gateway send the
+    workflow itself schedules on that same loop — until the run finishes. Hand the
+    work to a short-lived daemon thread so the caller returns immediately; the
+    workflow then delivers its own output through the normal gateway path.
+    """
+    threading.Thread(
+        target=trigger_workflow_now,
+        args=(workflow_id,),
+        name=f"workflow-resume-{workflow_id}",
+        daemon=True,
+    ).start()
 
 
 def _auto_disable_oneshot(workflow_id: str, run_info: Optional[Dict[str, Any]] = None) -> None:

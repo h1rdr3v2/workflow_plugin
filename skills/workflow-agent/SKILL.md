@@ -45,8 +45,12 @@ workflow_wait_for_user(
         "last_24h_trend": "increasing"
     })
 )
-# STOP after calling this — do NOT continue. The workflow resumes next run.
+# STOP after calling this — do NOT continue. The workflow resumes once the human answers.
 ```
+
+**`workflow_wait_for_user` delivers the question to the user itself.** Do NOT also send the
+same question with `workflow_send_message` (or any other send tool) first — that posts it twice.
+Use `workflow_send_message` only for one-way status updates that do not need a reply.
 
 ### 4. Handle Human Responses on Resume
 
@@ -92,6 +96,8 @@ workflow_create(
     name="Daily PR Review Rotation",
     cron_expression="0 9 * * 1-5",
     description="Rotates PR review assignments among the team each weekday morning",
+    deliver="origin",   # where output/messages go: origin | discord | telegram | slack | email | local
+    notify="summary",   # success notification: summary (default) | minimal | silent
     prompt=(
         "You manage PR review assignments.\n"
         "1. Use workflow_load_state('rotation_history') to see past assignments.\n"
@@ -103,21 +109,29 @@ workflow_create(
 )
 ```
 
+Pick `notify="minimal"` for side-effect jobs where the user just needs to know it ran, and
+`notify="summary"` when the output itself is the message (a digest, a pick, a report).
+
 ### 7. Tool Summary
 
-| Tool                       | When to Use                                                       |
-| -------------------------- | ----------------------------------------------------------------- |
-| `workflow_create`          | User asks to set up a new automated job                           |
-| `workflow_update`          | User asks to modify a workflow (schedule, prompt, enable/disable) |
-| `workflow_delete`          | User wants to remove a workflow entirely                          |
-| `workflow_list`            | User asks "what workflows do I have?"                             |
-| `workflow_get`             | User asks about a specific workflow's config                      |
-| `workflow_save_state`      | **Every run** — persist decisions/data for next run               |
-| `workflow_load_state`      | **Start of every run** — retrieve previous run's data             |
-| `workflow_delete_state`    | Clean up old/obsolete state keys                                  |
-| `workflow_wait_for_user`   | Need human approval or input — then STOP                          |
-| `workflow_submit_response` | Human responds to a pending question                              |
-| `workflow_list_pending`    | Check what's waiting for human input                              |
+| Tool                     | When to Use                                                       |
+| ------------------------ | ----------------------------------------------------------------- |
+| `workflow_create`        | User asks to set up a new automated job                           |
+| `workflow_update`        | User asks to modify a workflow (schedule, prompt, deliver, notify…) |
+| `workflow_delete`        | User wants to remove a workflow entirely                          |
+| `workflow_list`          | User asks "what workflows do I have?"                             |
+| `workflow_get`           | User asks about a specific workflow's config                      |
+| `workflow_enable`        | Resume a paused workflow                                          |
+| `workflow_disable`       | Pause a workflow (it can disable itself when its job is done)     |
+| `workflow_save_state`    | **Every run** — persist decisions/data for next run               |
+| `workflow_load_state`    | **Start of every run** — retrieve previous run's data             |
+| `workflow_delete_state`  | Clean up old/obsolete state keys                                  |
+| `workflow_wait_for_user` | Need human approval or input — delivers the question, then STOP    |
+| `workflow_send_message`  | One-way status update/result (never to ask a question)            |
+| `workflow_list_pending`  | Check what's waiting for human input                              |
+
+> `workflow_submit_response` exists for the human side (chat/dashboard/slash) to answer a
+> pending question — you generally won't call it during a run.
 
 ## Anti-Patterns
 
