@@ -314,7 +314,7 @@ def _handle_pre_gateway_dispatch(
         trigger_workflow_now(action["workflow_id"])
 
         # Send a confirmation back to the user via the gateway adapter
-        _send_confirmation(gateway, platform_str, str(chat_id), action["id"])
+        _send_confirmation(platform_str, str(chat_id))
 
         # Skip — the session agent should not process this message
         return {"action": "skip", "reason": "workflow-response-captured"}
@@ -324,45 +324,19 @@ def _handle_pre_gateway_dispatch(
         return None
 
 
-def _send_confirmation(
-    gateway: Any,
-    platform_str: str,
-    chat_id: str,
-    action_id: str,
-) -> None:
-    """Try to send a confirmation message that the workflow response was captured."""
-    _send_via_gateway(
-        gateway,
+def _send_confirmation(platform_str: str, chat_id: str) -> None:
+    """Confirm to the user that their workflow response was captured.
+
+    Routes through the scheduler's single gateway-delivery path so there is
+    exactly one place that talks to the live platform adapters.
+    """
+    from .scheduler import send_gateway_message
+
+    send_gateway_message(
         platform_str,
         chat_id,
-        f"✅ Got it! Your response has been recorded for the workflow.",
+        "✅ Got it! Your response has been recorded for the workflow.",
     )
-
-
-def _send_via_gateway(
-    gateway: Any,
-    platform_str: str,
-    chat_id: str,
-    message: str,
-) -> None:
-    """Send a message through the gateway adapter matching platform_str."""
-    try:
-        adapters = getattr(gateway, "adapters", {}) or {}
-        for plat, adapter in adapters.items():
-            plat_str = plat.value if hasattr(plat, "value") else str(plat)
-            if plat_str.lower() == platform_str.lower():
-                import asyncio
-                loop = getattr(gateway, "loop", None)
-                if loop and loop.is_running():
-                    async def _send():
-                        try:
-                            await adapter.send(chat_id, message)
-                        except Exception:
-                            pass
-                    asyncio.run_coroutine_threadsafe(_send(), loop)
-                break
-    except Exception:
-        pass  # Best-effort; don't block on failure
 
 
 # ── Agent invocation callback ─────────────────────────────────────────────

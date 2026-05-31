@@ -54,9 +54,59 @@ def set_executor(fn: Callable[..., Any]) -> None:
 # ── Gateway ref —──────────────────────────────────────────────────────────
 
 def set_gateway_ref(gateway: Any) -> None:
-    """Store a reference to the GatewayRunner for message delivery."""
+    """Store a reference to the live GatewayRunner for message delivery.
+
+    This is only an optimization: :func:`_resolve_gateway` also recovers the
+    runner from Hermes' process-global weakref, so workflow messages are
+    delivered even when no inbound message has primed this reference via the
+    ``pre_gateway_dispatch`` hook (e.g. a one-shot firing from its timer, or a
+    workflow created from the dashboard).
+    """
     global _gateway_ref
     _gateway_ref = gateway
+
+
+def _resolve_gateway() -> Any:
+    """Return the live Hermes GatewayRunner, or None when unavailable.
+
+    Prefers an explicitly-stored reference, then falls back to the
+    process-global weakref Hermes sets in ``GatewayRunner.__init__``
+    (``gateway.run._gateway_runner_ref``). This removes the dependence on an
+    inbound message having primed the reference first.
+    """
+    global _gateway_ref
+    if _gateway_ref is not None:
+        return _gateway_ref
+    try:
+        from gateway.run import _gateway_runner_ref
+        gateway = _gateway_runner_ref()
+    except Exception:
+        return None
+    if gateway is not None:
+        _gateway_ref = gateway
+    return gateway
+
+
+def _running_gateway_loop(gateway: Any) -> Any:
+    """Return the gateway's running asyncio loop, or None.
+
+    The GatewayRunner stores its loop on ``_gateway_loop``; tolerate a plain
+    ``loop`` attribute too in case that ever changes.
+    """
+    loop = getattr(gateway, "_gateway_loop", None) or getattr(gateway, "loop", None)
+    if loop is not None and getattr(loop, "is_running", lambda: False)():
+        return loop
+    return None
+
+
+def _find_adapter(gateway: Any, platform_str: str) -> Any:
+    """Return the connected adapter whose platform matches ``platform_str``."""
+    adapters = getattr(gateway, "adapters", None) or {}
+    for plat, adapter in adapters.items():
+        plat_value = plat.value if hasattr(plat, "value") else str(plat)
+        if plat_value.lower() == platform_str.lower():
+            return adapter
+    return None
 
 
 # ── Schedule / unschedule ─────────────────────────────────────────────────
@@ -346,11 +396,7 @@ def _send_via_gateway(
     message: str,
     thread_id: Optional[str] = None,
 ) -> None:
-    """Send a message through the gateway adapter matching platform_str.
-
-    Best-effort — never raises, never blocks the scheduler.
-    """
-    global _gateway_ref
+    """Thin wrapper kept for call-site readability — see send_gateway_message."""
     send_gateway_message(platform_str, chat_id, message, thread_id=thread_id)
 
 
@@ -360,41 +406,101 @@ def send_gateway_message(
     message: str,
     thread_id: Optional[str] = None,
 ) -> bool:
-    """Send a message through the live gateway adapter, if available."""
-    global _gateway_ref
+    """Deliver a message to a chat through the live Hermes gateway.
+
+    Resolves the running GatewayRunner, finds the adapter for the target
+    platform, and schedules the async send on the gateway event loop. Never
+    raises and never blocks that loop; genuine send failures are surfaced via
+    a logged done-callback instead of being silently swallowed.
+
+    Returns True when the send was scheduled onto a live adapter, False when
+    no gateway/adapter/loop is available to deliver it.
+    """
+    import asyncio
+
     if not platform_str or not chat_id:
         return False
-    if _gateway_ref is None:
-        logger.debug("No gateway reference available for delivery to %s", platform_str)
+
+    gateway = _resolve_gateway()
+    if gateway is None:
+        logger.warning(
+            "Workflow message to %s:%s dropped — no live gateway "
+            "(is the Hermes gateway running?)",
+            platform_str, chat_id,
+        )
         return False
 
+    loop = _running_gateway_loop(gateway)
+    if loop is None:
+        logger.warning(
+            "Workflow message to %s:%s dropped — gateway event loop not running",
+            platform_str, chat_id,
+        )
+        return False
+
+    adapter = _find_adapter(gateway, platform_str)
+    if adapter is None:
+        logger.warning(
+            "Workflow message to %s:%s dropped — no connected adapter for "
+            "platform '%s'",
+            platform_str, chat_id, platform_str,
+        )
+        return False
+
+    async def _send() -> Any:
+        metadata = {"thread_id": thread_id} if thread_id else None
+        try:
+            return await adapter.send(str(chat_id), message, metadata=metadata)
+        except TypeError:
+            # Older adapters don't accept a metadata kwarg.
+            return await adapter.send(str(chat_id), message)
+
+    def _log_outcome(get_result) -> None:
+        try:
+            result = get_result()
+        except Exception:
+            logger.warning(
+                "Workflow message to %s:%s failed to send",
+                platform_str, chat_id, exc_info=True,
+            )
+            return
+        failed = (
+            result.get("success") is False if isinstance(result, dict)
+            else getattr(result, "success", True) is False
+        )
+        if failed:
+            error = (
+                result.get("error") if isinstance(result, dict)
+                else getattr(result, "error", None)
+            )
+            logger.warning(
+                "Workflow message to %s:%s rejected by adapter: %s",
+                platform_str, chat_id, error,
+            )
+
     try:
-        adapters = getattr(_gateway_ref, "adapters", {}) or {}
-        for plat, adapter in adapters.items():
-            plat_str = plat.value if hasattr(plat, "value") else str(plat)
-            if plat_str.lower() == platform_str.lower():
-                import asyncio
-                loop = getattr(_gateway_ref, "loop", None)
-                if loop and loop.is_running():
-                    async def _send():
-                        try:
-                            metadata = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(str(chat_id), message, metadata=metadata)
-                        except TypeError:
-                            await adapter.send(str(chat_id), message)
-                        except Exception:
-                            logger.debug(
-                                "Gateway send failed to %s:%s",
-                                platform_str,
-                                chat_id,
-                                exc_info=True,
-                            )
-                    asyncio.run_coroutine_threadsafe(_send(), loop)
-                    return True
-                return False
+        # Schedule on the gateway loop. If we're already running on that loop
+        # (e.g. invoked from within the pre_gateway_dispatch hook), create the
+        # task directly; otherwise hand it across threads. Either way we never
+        # block the loop waiting on its own coroutine.
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+
+        if current is loop:
+            task = loop.create_task(_send())
+            task.add_done_callback(lambda t: _log_outcome(t.result))
+        else:
+            future = asyncio.run_coroutine_threadsafe(_send(), loop)
+            future.add_done_callback(lambda f: _log_outcome(f.result))
+        return True
     except Exception:
-        logger.debug("Gateway send scheduling failed", exc_info=True)
-    return False
+        logger.warning(
+            "Workflow message to %s:%s could not be scheduled",
+            platform_str, chat_id, exc_info=True,
+        )
+        return False
 
 
 # ── Timeout checker ───────────────────────────────────────────────────────
