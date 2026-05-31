@@ -53,26 +53,12 @@ def set_executor(fn: Callable[..., Any]) -> None:
 
 # ── Gateway ref —──────────────────────────────────────────────────────────
 
-def set_gateway_ref(gateway: Any) -> None:
-    """Store a reference to the live GatewayRunner for message delivery.
-
-    This is only an optimization: :func:`_resolve_gateway` also recovers the
-    runner from Hermes' process-global weakref, so workflow messages are
-    delivered even when no inbound message has primed this reference via the
-    ``pre_gateway_dispatch`` hook (e.g. a one-shot firing from its timer, or a
-    workflow created from the dashboard).
-    """
-    global _gateway_ref
-    _gateway_ref = gateway
-
-
 def _resolve_gateway() -> Any:
     """Return the live Hermes GatewayRunner, or None when unavailable.
 
-    Prefers an explicitly-stored reference, then falls back to the
-    process-global weakref Hermes sets in ``GatewayRunner.__init__``
-    (``gateway.run._gateway_runner_ref``). This removes the dependence on an
-    inbound message having primed the reference first.
+    Recovers the runner from the process-global weakref Hermes sets in
+    ``GatewayRunner.__init__`` (``gateway.run._gateway_runner_ref``). The
+    resolved runner is cached so subsequent sends skip the lookup.
     """
     global _gateway_ref
     if _gateway_ref is not None:
@@ -494,9 +480,9 @@ def send_gateway_message(
 
     try:
         # Schedule on the gateway loop. If we're already running on that loop
-        # (e.g. invoked from within the pre_gateway_dispatch hook), create the
-        # task directly; otherwise hand it across threads. Either way we never
-        # block the loop waiting on its own coroutine.
+        # (e.g. a workflow_send_message issued from within an async route),
+        # create the task directly; otherwise hand it across threads. Either
+        # way we never block the loop waiting on its own coroutine.
         try:
             current = asyncio.get_running_loop()
         except RuntimeError:

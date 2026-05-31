@@ -441,19 +441,41 @@ class WorkflowDB:
             _write_json(self._pending_path, pending)
         return True
 
-    def get_resolved_since(
-        self, workflow_id: str, since: float
+    def get_unacknowledged_responses(
+        self, workflow_id: str
     ) -> List[Dict[str, Any]]:
-        """Get actions resolved since a timestamp (for agent context injection)."""
+        """Get resolved answers the agent has not consumed yet.
+
+        A response is "acknowledged" once a run has been built with it in
+        context (see :meth:`acknowledge_responses`). This guarantees a human
+        answer is surfaced to the agent exactly once — so a resumed run acts on
+        it instead of re-asking, and later scheduled runs don't replay stale
+        answers.
+        """
         with self._lock:
             pending = _read_json(self._pending_path) or []
         result = [
             a for a in pending
             if a["workflow_id"] == workflow_id
             and a.get("status") == "resolved"
-            and (a.get("responded_at") or 0) > since
+            and not a.get("acknowledged")
         ]
         return sorted(result, key=lambda a: a.get("responded_at", 0))
+
+    def acknowledge_responses(self, action_ids: List[str]) -> None:
+        """Mark the given resolved actions as consumed by a run."""
+        if not action_ids:
+            return
+        wanted = set(action_ids)
+        with self._lock:
+            pending = _read_json(self._pending_path) or []
+            changed = False
+            for a in pending:
+                if a["id"] in wanted and not a.get("acknowledged"):
+                    a["acknowledged"] = True
+                    changed = True
+            if changed:
+                _write_json(self._pending_path, pending)
 
     def get_expired_actions(self) -> List[Dict[str, Any]]:
         """Get all pending actions that have passed their expires_at timestamp."""
@@ -481,47 +503,6 @@ class WorkflowDB:
                     logger.info("Pending action expired: id=%s", action_id)
                     return a
         return None
-
-    def find_pending_by_origin(
-        self,
-        platform: str,
-        chat_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Find the first pending action for a given platform + chat_id.
-
-        Used by the pre_gateway_dispatch hook to route incoming chat messages
-        to the correct pending workflow action.
-
-        Matching is lenient on purpose: chat_id is compared as a trimmed
-        string and platform case-insensitively, because the origin captured
-        when the workflow was created and the values on an inbound event can
-        differ in type or case (e.g. int vs str, "Discord" vs "discord").
-        Falls back to a chat_id-only match — a single chat almost never has
-        pending actions spanning multiple platforms — so a user's reply still
-        resumes the workflow even when the platform label doesn't line up.
-
-        Returns the action dict if found, None otherwise.
-        """
-        want_chat = str(chat_id).strip() if chat_id is not None else ""
-        want_platform = str(platform).strip().lower() if platform else ""
-        if not want_chat:
-            return None
-
-        with self._lock:
-            pending = _read_json(self._pending_path) or []
-
-        chat_only_match: Optional[Dict[str, Any]] = None
-        for a in pending:
-            if a.get("status") != "pending":
-                continue
-            if str(a.get("origin_chat_id") or "").strip() != want_chat:
-                continue
-            a_platform = str(a.get("origin_platform") or "").strip().lower()
-            if want_platform and a_platform and a_platform == want_platform:
-                return a  # exact platform + chat match wins
-            if chat_only_match is None:
-                chat_only_match = a  # remember as a fallback
-        return chat_only_match
 
     # ══════════════════════════════════════════════════════════════════
     # Lifecycle

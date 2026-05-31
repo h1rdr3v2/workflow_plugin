@@ -7,10 +7,9 @@ the scheduler, and the bundled workflow-agent skill.
 Key components:
 - 14 tools: create/update/delete/list/get, enable/disable, save/load/delete
   state, wait_for_user, submit_response, list_pending, send_message
-- pre_gateway_dispatch hook: captures a user's chat reply as the answer to a
-  paused workflow question and resumes the workflow off-thread
 - plugin_shutdown hook: gracefully stops the scheduler
-- /workflows slash command: human interface to review and respond
+- /workflows slash command: the human interface to review and respond to
+  paused workflows (`/workflows respond <id> <answer>`)
 - workflow-agent skill: teaches the agent the workflow pattern
 """
 
@@ -154,105 +153,6 @@ def _fmt_time(ts: Optional[float]) -> str:
 def _on_shutdown(**kwargs: Any) -> None:
     """Gracefully stop the scheduler when the plugin is unloaded."""
     scheduler_shutdown()
-
-
-# ── pre_gateway_dispatch hook — capture chat replies for workflows ────────
-
-
-def _handle_pre_gateway_dispatch(
-    event: Any,
-    gateway: Any,
-    session_store: Any,
-    **kwargs: Any,
-) -> Optional[Dict[str, str]]:
-    """
-    Intercept incoming chat messages to capture workflow responses.
-
-    When a workflow has a pending action for the same platform+chat_id,
-    the user's reply is captured as the human response and the session
-    agent never sees it (return {"action": "skip"}).
-
-    If no matching pending action exists, returns None (normal dispatch).
-    """
-    try:
-        try:
-            from .scheduler import set_gateway_ref
-            set_gateway_ref(gateway)
-        except Exception:
-            pass
-
-        source = getattr(event, "source", None)
-        if source is None:
-            return None
-
-        platform = getattr(source, "platform", None)
-        if platform is None:
-            return None
-        platform_str = platform.value if hasattr(platform, "value") else str(platform)
-
-        chat_id = getattr(source, "chat_id", None)
-        if not chat_id:
-            return None
-
-        text = getattr(event, "text", "") or ""
-
-        db = get_db()
-        action = db.find_pending_by_origin(platform_str, str(chat_id))
-
-        if action is None:
-            # Not for us — let the message reach the agent normally. Logged so
-            # a missed capture is diagnosable (compare against pending origins).
-            logger.debug(
-                "pre_gateway_dispatch: no pending workflow action for %s:%s",
-                platform_str, chat_id,
-            )
-            return None  # No pending action for this chat — normal dispatch
-
-        # Capture the user's message as the response
-        resolved = db.resolve_pending_action(action["id"], text)
-
-        if resolved is None:
-            return None  # Action was already resolved/dismissed
-
-        logger.info(
-            "pre_gateway_dispatch: captured reply for action %s (workflow=%s, platform=%s, chat=%s)",
-            action["id"],
-            action["workflow_id"],
-            platform_str,
-            chat_id,
-        )
-
-        # Resume immediately — don't wait for next cron tick. Must run OFF this
-        # thread: this hook executes on the gateway's asyncio event loop, and a
-        # synchronous agent run here would block the whole gateway. Delivery is
-        # handled by scheduler._deliver_workflow_output.
-        from .scheduler import trigger_workflow_now_async
-        trigger_workflow_now_async(action["workflow_id"])
-
-        # Send a confirmation back to the user via the gateway adapter
-        _send_confirmation(platform_str, str(chat_id))
-
-        # Skip — the session agent should not process this message
-        return {"action": "skip", "reason": "workflow-response-captured"}
-
-    except Exception:
-        logger.exception("pre_gateway_dispatch hook failed")
-        return None
-
-
-def _send_confirmation(platform_str: str, chat_id: str) -> None:
-    """Confirm to the user that their workflow response was captured.
-
-    Routes through the scheduler's single gateway-delivery path so there is
-    exactly one place that talks to the live platform adapters.
-    """
-    from .scheduler import send_gateway_message
-
-    send_gateway_message(
-        platform_str,
-        chat_id,
-        "✅ Got it! Your response has been recorded for the workflow.",
-    )
 
 
 # ── Agent invocation callback ─────────────────────────────────────────────
@@ -456,7 +356,6 @@ def register(ctx: Any) -> None:
         )
 
     # ── Register hooks ────────────────────────────────────────────────
-    ctx.register_hook("pre_gateway_dispatch", _handle_pre_gateway_dispatch)
     ctx.register_hook("plugin_shutdown", _on_shutdown)
 
     # ── Register slash command ────────────────────────────────────────
@@ -490,6 +389,6 @@ def register(ctx: Any) -> None:
         logger.warning("Failed to start workflow scheduler", exc_info=True)
 
     logger.info(
-        "Workflow Engine registered (%d tools, 2 hooks, 1 command, 1 skill)",
+        "Workflow Engine registered (%d tools, 1 hook, 1 command, 1 skill)",
         len(schema_map),
     )

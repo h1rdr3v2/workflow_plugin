@@ -54,7 +54,7 @@ Use `workflow_send_message` only for one-way status updates that do not need a r
 
 ### 4. Handle Human Responses on Resume
 
-On the next run after a human has responded, the resolved responses are automatically injected into your context. Check them at the start of your run and incorporate them into your decisions.
+When a human answers a paused question (via `/workflows respond <id> <answer>`), the workflow resumes and their answer is injected at the top of your run instructions. **Act on it — do not re-ask the same question.** Each answer is surfaced to you exactly once, so treat its presence as "this decision is now made."
 
 ### 5. Fair Rotation Pattern
 
@@ -130,8 +130,8 @@ Pick `notify="minimal"` for side-effect jobs where the user just needs to know i
 | `workflow_send_message`  | One-way status update/result (never to ask a question)            |
 | `workflow_list_pending`  | Check what's waiting for human input                              |
 
-> `workflow_submit_response` exists for the human side (chat/dashboard/slash) to answer a
-> pending question — you generally won't call it during a run.
+> `workflow_submit_response` exists for the human side (dashboard / `/workflows respond`) to
+> answer a pending question — you generally won't call it during a run.
 
 ## Anti-Patterns
 

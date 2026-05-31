@@ -112,11 +112,17 @@ def execute(workflow_id: str) -> Dict[str, Any]:
         # ── 3. Gather context ─────────────────────────────────────────
         context = _build_context(db, workflow_id, wf)
 
+        # Answers injected into this run, to mark consumed once the agent
+        # has actually seen them (success/paused) — not on error, so a failed
+        # run can be retried with the answer still pending.
+        consumed_response_ids = [r["id"] for r in context.get("resolved_responses", [])]
+
         # ── 4. Build messages ─────────────────────────────────────────
         system_prompt = _build_system_prompt(wf, context)
         user_message = _build_user_message(wf, context)
 
-        # ── 5. Extract origin for chat-based reply capture ────────────
+        # ── 5. Extract origin so the agent can deliver to / notify the
+        #       originating chat (workflow_send_message, wait_for_user) ──
         origin_kwargs: Dict[str, Any] = {}
         origin = wf.get("origin")
         if isinstance(origin, dict):
@@ -177,6 +183,11 @@ def execute(workflow_id: str) -> Dict[str, Any]:
             })
             logger.info("Workflow '%s' completed successfully", workflow_id)
 
+        # The agent ran and saw the injected answers — mark them consumed so
+        # they don't replay (and trigger a re-ask) on the next run.
+        if consumed_response_ids:
+            db.acknowledge_responses(consumed_response_ids)
+
     except Exception as e:
         finished_at = time.time()
         run_info.update({
@@ -223,10 +234,11 @@ def _build_context(db: Any, workflow_id: str, wf: Dict[str, Any]) -> Dict[str, A
         logger.warning("Failed to load pending actions: %s", e)
         context["pending_actions"] = []
 
-    # Recently resolved actions (human responded, agent should act on it)
+    # Human answers the agent hasn't consumed yet. Surfaced exactly once
+    # (see WorkflowDB.get_unacknowledged_responses) so a resumed run acts on
+    # the answer instead of re-asking the same question.
     try:
-        # Get resolved actions from the last 24 hours (or since epoch if first run)
-        resolved = db.get_resolved_since(workflow_id, 0)
+        resolved = db.get_unacknowledged_responses(workflow_id)
         context["resolved_responses"] = [
             {
                 "id": pa["id"],
@@ -304,18 +316,41 @@ def _build_system_prompt(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
 
 
 def _build_user_message(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """Build the user message that triggers the agent to act."""
+    """Build the user message that triggers the agent to act.
+
+    When a human has just answered a paused question, the answer is placed
+    front-and-centre here (the freshest, most-attended part of the prompt)
+    with an explicit "act on this, do not re-ask" directive — this is what
+    keeps a resumed run from asking the same question again.
+    """
+    name = context["workflow_name"]
     resolved = context.get("resolved_responses", [])
     state = context.get("state", {})
 
-    msg = f"Run the workflow **{context['workflow_name']}**."
-
     if resolved:
-        msg += f"\n\n{len(resolved)} human response(s) are available since your last run. Please check them."
+        lines = [
+            f"A human has answered your pending question(s) for workflow "
+            f"**{name}**. Act on these answers and continue — do NOT ask "
+            f"them again:",
+        ]
+        for r in resolved:
+            lines.append(
+                f"\n• You asked: {r['question']}\n"
+                f"  They answered: {r['response']}"
+            )
+        lines.append(
+            "\nResume the workflow from where it paused, using the answer(s) "
+            "above. Load any state you need, do the work, save updated state, "
+            "then finish with a short summary."
+        )
+        return "\n".join(lines)
 
+    msg = f"Run the workflow **{name}** now."
     if state:
-        msg += f"\n\n{len(state)} state key(s) are available from prior runs."
-
+        msg += (
+            f" {len(state)} state key(s) are available from prior runs — "
+            f"load what you need before acting."
+        )
     return msg
 
 

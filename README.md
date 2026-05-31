@@ -38,7 +38,7 @@ Agent: [calls workflow_create with appropriate params]
 
 ```
 ~/.hermes/plugins/workflow/
-├── plugin.yaml              # Manifest: 14 tools, 2 hooks
+├── plugin.yaml              # Manifest: 14 tools, 1 hook
 ├── __init__.py              # register(ctx) — wires tools, hooks, scheduler, skill, agent invocation
 ├── db.py                    # JSON-file store (~/.hermes/workflow_engine/)
 ├── scheduler.py             # croniter-based polling scheduler + gateway delivery
@@ -77,20 +77,20 @@ Agent: [calls workflow_create with appropriate params]
 
 ## Hooks
 
-| Hook                   | Purpose                                                                                                          |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `pre_gateway_dispatch` | Captures a user's chat reply as the answer to a paused workflow question and resumes the workflow off-thread     |
-| `plugin_shutdown`      | Gracefully stops the scheduler                                                                                  |
+| Hook              | Purpose                        |
+| ----------------- | ------------------------------ |
+| `plugin_shutdown` | Gracefully stops the scheduler |
 
-> Workflow state, resolved responses, and pending questions are injected directly into the agent's system prompt by `executor._build_system_prompt` at run time — there is no `pre_llm_call` hook (Hermes does not pass a `workflow_id` to that hook, so it could not identify the running workflow).
+> Workflow state, resolved responses, and pending questions are injected directly into the agent's prompt by the executor at run time — there is no `pre_llm_call` hook (Hermes does not pass a `workflow_id` to that hook, so it could not identify the running workflow).
 
 ## Human Interface
 
 - **`/workflows`** — list all workflows and pending actions
-- **`/workflows respond <action_id> <answer>`** — respond to a pending question
+- **`/workflows respond <action_id> <answer>`** — answer a pending question (resumes the workflow immediately)
 - **`/workflows dismiss <action_id>`** — dismiss without responding
-- **Reply in chat** — if a workflow has an `origin`, replying in that chat is captured as the answer (best-effort)
-- **Dashboard tab** — full CRUD, state inspection, pending action management
+- **Dashboard tab** — full CRUD, state inspection, pending action management (including respond/dismiss)
+
+> When a workflow pauses, its question is delivered to the workflow's chat (if it has an `origin`) so you're notified — but answers come back through `/workflows respond` or the dashboard, not by replying in the chat.
 
 ## Delivery & Notification
 
@@ -114,7 +114,7 @@ Scheduler fires a tick (cron, one-shot timer, or immediate resume)
 ```
 
 - **Overlap protection** — a workflow with an unresolved pending action won't trigger again until it's resolved.
-- **Immediate resume** — a human response (chat reply, `/workflows respond`, dashboard, or `workflow_submit_response`) resumes the workflow at once. Resumes always run on a background thread, never on the gateway/web event loop.
+- **Immediate resume** — a human response (`/workflows respond`, dashboard, or `workflow_submit_response`) resumes the workflow at once. Resumes always run on a background thread, never on the gateway/web event loop.
 - **One-shot** — workflows created with `trigger_at`/`trigger_in` fire once and auto-disable.
 
 ## Storage

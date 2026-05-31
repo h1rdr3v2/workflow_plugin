@@ -151,7 +151,7 @@ def _try_notify_user(
     try:
         message = (
             f"{question}\n\n"
-            f"_Reply here, or use _```/workflows respond {action_id} <your answer>```"
+            f"_To answer, use_ ```/workflows respond {action_id} <your answer>```"
         )
         send_gateway_message(
             origin_platform,
@@ -725,7 +725,7 @@ def _handle_wait_for_user(args: Dict[str, Any], **kwargs: Any) -> str:
             "status": "pending",
             "message": (
                 f"Workflow '{current_wf}' is now paused, awaiting human input. "
-                f"The human can reply directly in this chat or use /workflows. "
+                f"The human answers with /workflows respond. "
                 f"IMPORTANT: End this run now. The workflow will resume "
                 f"immediately after the human responds."
             ),
