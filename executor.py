@@ -245,6 +245,7 @@ def _build_context(db: Any, workflow_id: str, wf: Dict[str, Any]) -> Dict[str, A
                 "question": pa["question"],
                 "response": pa["response"],
                 "responded_at": pa["responded_at"],
+                "timeout_status": pa.get("timeout_status"),
             }
             for pa in resolved[-10:]  # last 10 to avoid context bloat
         ]
@@ -329,17 +330,24 @@ def _build_user_message(wf: Dict[str, Any], context: Dict[str, Any]) -> str:
 
     if resolved:
         lines = [
-            f"A human has answered your pending question(s) for workflow "
-            f"**{name}**. Act on these answers and continue — do NOT ask "
-            f"them again:",
+            f"Your pending question(s) for workflow **{name}** have been "
+            f"closed out. Continue the workflow accordingly — do NOT ask them "
+            f"again:",
         ]
         for r in resolved:
-            lines.append(
-                f"\n• You asked: {r['question']}\n"
-                f"  They answered: {r['response']}"
-            )
+            if r.get("timeout_status") == "expired":
+                lines.append(
+                    f"\n• You asked: {r['question']}\n"
+                    f"  ⏰ No answer within the time limit — proceed WITHOUT "
+                    f"the human's input, using your best judgement."
+                )
+            else:
+                lines.append(
+                    f"\n• You asked: {r['question']}\n"
+                    f"  A human answered: {r['response']}"
+                )
         lines.append(
-            "\nResume the workflow from where it paused, using the answer(s) "
+            "\nResume the workflow from where it paused, using the outcome(s) "
             "above. Load any state you need, do the work, save updated state, "
             "then finish with a short summary."
         )

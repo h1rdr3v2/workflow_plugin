@@ -490,17 +490,24 @@ class WorkflowDB:
         ]
 
     def expire_action(self, action_id: str) -> Optional[Dict[str, Any]]:
-        """Mark a pending action as expired due to timeout."""
+        """Mark a pending action as timed-out (no answer within the limit).
+
+        Recorded as ``status="resolved"`` with ``timeout_status="expired"`` so
+        it flows through the same unacknowledged-response path as a real answer
+        — the resumed run is told the question timed out and proceeds without
+        input, instead of re-asking. (This is distinct from a user *dismissal*,
+        which stays ``status="dismissed"`` and is never surfaced as an answer.)
+        """
         now = time.time()
         with self._lock:
             pending = _read_json(self._pending_path) or []
             for a in pending:
                 if a["id"] == action_id and a.get("status") == "pending":
-                    a["status"] = "dismissed"
+                    a["status"] = "resolved"
                     a["timeout_status"] = "expired"
                     a["responded_at"] = now
                     _write_json(self._pending_path, pending)
-                    logger.info("Pending action expired: id=%s", action_id)
+                    logger.info("Pending action timed out: id=%s", action_id)
                     return a
         return None
 
