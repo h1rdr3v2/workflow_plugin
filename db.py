@@ -487,18 +487,36 @@ class WorkflowDB:
         Used by the pre_gateway_dispatch hook to route incoming chat messages
         to the correct pending workflow action.
 
+        Matching is lenient on purpose: chat_id is compared as a trimmed
+        string and platform case-insensitively, because the origin captured
+        when the workflow was created and the values on an inbound event can
+        differ in type or case (e.g. int vs str, "Discord" vs "discord").
+        Falls back to a chat_id-only match — a single chat almost never has
+        pending actions spanning multiple platforms — so a user's reply still
+        resumes the workflow even when the platform label doesn't line up.
+
         Returns the action dict if found, None otherwise.
         """
+        want_chat = str(chat_id).strip() if chat_id is not None else ""
+        want_platform = str(platform).strip().lower() if platform else ""
+        if not want_chat:
+            return None
+
         with self._lock:
             pending = _read_json(self._pending_path) or []
+
+        chat_only_match: Optional[Dict[str, Any]] = None
         for a in pending:
-            if (
-                a.get("status") == "pending"
-                and a.get("origin_platform") == platform
-                and a.get("origin_chat_id") == chat_id
-            ):
-                return a
-        return None
+            if a.get("status") != "pending":
+                continue
+            if str(a.get("origin_chat_id") or "").strip() != want_chat:
+                continue
+            a_platform = str(a.get("origin_platform") or "").strip().lower()
+            if want_platform and a_platform and a_platform == want_platform:
+                return a  # exact platform + chat match wins
+            if chat_only_match is None:
+                chat_only_match = a  # remember as a fallback
+        return chat_only_match
 
     # ══════════════════════════════════════════════════════════════════
     # Lifecycle

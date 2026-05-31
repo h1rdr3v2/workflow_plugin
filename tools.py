@@ -139,10 +139,8 @@ def _try_notify_user(
 
     try:
         message = (
-            f"Workflow needs your input\n\n"
-            f"> {question}\n\n"
-            f"Reply directly in this chat with your answer, "
-            f"or use `/workflows respond {action_id} <your answer>`."
+            f"{question}\n\n"
+            f"_Reply here, or use _```/workflows respond {action_id} <your answer>```"
         )
         send_gateway_message(
             origin_platform,

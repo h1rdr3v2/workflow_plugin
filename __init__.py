@@ -292,6 +292,12 @@ def _handle_pre_gateway_dispatch(
         action = db.find_pending_by_origin(platform_str, str(chat_id))
 
         if action is None:
+            # Not for us — let the message reach the agent normally. Logged so
+            # a missed capture is diagnosable (compare against pending origins).
+            logger.debug(
+                "pre_gateway_dispatch: no pending workflow action for %s:%s",
+                platform_str, chat_id,
+            )
             return None  # No pending action for this chat — normal dispatch
 
         # Capture the user's message as the response
